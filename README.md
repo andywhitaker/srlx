@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-`srlx` is a custom Nokia SR Linux CLI plugin and topology management suite that enables network operators to execute CLI commands across neighboring SR Linux switches directly from their terminal prompt **with zero local command leakage**.
+`srlx` is a custom Nokia SR Linux CLI plugin and topology management suite that enables network operators to execute CLI commands across neighboring SR Linux switches directly from their terminal prompt.
 
 It includes a lightweight background daemon (`srlx-daemon.py`) managed by SR Linux `appmgr` that performs **realtime LLDP event subscriptions**, validates direct **Mutual TLS (mTLS)** reachability, and gossips node information across the fabric to maintain a resilient mesh topology view.
 
