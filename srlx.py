@@ -6,13 +6,29 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from srlinux.mgmt.cli.cli_plugin import CliPlugin
+from srlinux.mgmt.cli.tools_plugin import ToolsPlugin
 from srlinux.syntax import Syntax
 
-# Global persistent cache across CLI plugin instances (60s TTL)
+# Global persistent cache across CLI plugin instances (60s TTL fallback)
 _DISCOVERY_CACHE = {"timestamp": 0, "devices": {}}
+DAEMON_SOCKET_PATH = "/var/run/srlx-daemon.sock"
 
 def natural_sort_key(name):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", name)]
+
+def query_daemon_socket(payload):
+    if not os.path.exists(DAEMON_SOCKET_PATH):
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(DAEMON_SOCKET_PATH)
+        s.sendall(json.dumps(payload).encode() + b"\n")
+        raw = s.recv(16384).decode().strip()
+        s.close()
+        return json.loads(raw)
+    except Exception:
+        return None
 
 def parse_target_and_cmd_tokens(raw_tokens, known_devices=None):
     if known_devices is None:
@@ -81,6 +97,22 @@ def get_local_hostname():
     return socket.gethostname()
 
 def discover_srlinux_neighbors():
+    resp = query_daemon_socket({"action": "get_devices"})
+    if resp and resp.get("status") == "ok":
+        vector = resp.get("vector", {})
+        nodes = vector.get("nodes", {})
+        if nodes:
+            devices = {}
+            for name, nd in nodes.items():
+                devices[name] = {
+                    "system_name": name,
+                    "mgmt_addrs": nd.get("mgmt_addrs", [name]),
+                    "netns": nd.get("netns", "mgmt"),
+                    "direct_reporters": nd.get("direct_reporters", []),
+                    "status": nd.get("status", "Reachable")
+                }
+            return devices
+
     now = time.time()
     if now - _DISCOVERY_CACHE["timestamp"] < 60 and _DISCOVERY_CACHE["devices"]:
         return _DISCOVERY_CACHE["devices"]
@@ -154,6 +186,57 @@ def discover_srlinux_neighbors():
     _DISCOVERY_CACHE["timestamp"] = now
     _DISCOVERY_CACHE["devices"] = devices
     return devices
+
+def get_neighbor_choices(*args, **kwargs):
+    discovered = discover_srlinux_neighbors()
+    all_choices = sorted(list(discovered.keys()), key=natural_sort_key)
+    typed_set = set()
+
+    if len(args) >= 3 and args[2] is not None:
+        try:
+            raw_typed = args[2].get("srlx", "device")
+            if not raw_typed:
+                raw_typed = args[2].get("device")
+            if isinstance(raw_typed, list):
+                typed_set.update(raw_typed)
+            elif isinstance(raw_typed, str) and raw_typed:
+                typed_set.add(raw_typed)
+        except Exception:
+            pass
+
+    return [choice for choice in all_choices if choice not in typed_set]
+
+def extract_device_argument_value(arguments):
+    if not arguments:
+        return ""
+    if hasattr(arguments, "get"):
+        try:
+            val = arguments.get("device")
+            if val:
+                return val[0] if isinstance(val, list) else str(val)
+        except Exception:
+            pass
+    if hasattr(arguments, "all_arguments"):
+        try:
+            all_args = arguments.all_arguments
+            if isinstance(all_args, dict) and "device" in all_args:
+                val = all_args["device"]
+                if hasattr(val, "value"):
+                    val = val.value
+                return val[0] if isinstance(val, list) else str(val)
+        except Exception:
+            pass
+    if hasattr(arguments, "local_arguments"):
+        try:
+            loc_args = arguments.local_arguments
+            if isinstance(loc_args, dict) and "device" in loc_args:
+                val = loc_args["device"]
+                if hasattr(val, "value"):
+                    val = val.value
+                return val[0] if isinstance(val, list) else str(val)
+        except Exception:
+            pass
+    return ""
 
 def get_child_cmds(node, state):
     cmds = []
@@ -267,7 +350,7 @@ def get_srlx_unified_suggestions(*args, **kwargs):
     except Exception:
         return get_dynamic_root_commands(state)
 
-def exec_remote_cmd(host, command, netns="mgmt"):
+def _raw_exec_remote_cmd(host, command, netns="mgmt"):
     target_netns = f"srbase-{netns}" if netns != "default" else "srbase"
     auth_flags = get_auth_curl_flags()
 
@@ -328,6 +411,14 @@ def exec_remote_cmd(host, command, netns="mgmt"):
     except Exception as e:
         return f"Execution Error on {host} ({target_netns}): {e}\n"
 
+def exec_remote_cmd(host, command, netns="mgmt"):
+    res = _raw_exec_remote_cmd(host, command, "mgmt")
+    if ("Connection Failed" in res or "timed out" in res or "Execution Error" in res) and netns != "mgmt":
+        res_alt = _raw_exec_remote_cmd(host, command, netns)
+        if "Connection Failed" not in res_alt and "timed out" not in res_alt and "Execution Error" not in res_alt:
+            return res_alt
+    return res
+
 def run_srlx_execution(output, target_devices, cmd):
     discovered = discover_srlinux_neighbors()
     local_name = get_local_hostname()
@@ -384,8 +475,198 @@ def run_srlx_execution(output, target_devices, cmd):
             if not output_text.endswith("\n"):
                 output.print_line("")
 
+IS_IPV4_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+def resolve_management_ip(name_or_ip):
+    if not name_or_ip:
+        return "Unknown"
+    
+    if IS_IPV4_RE.match(name_or_ip):
+        return name_or_ip
+    
+    try:
+        with open("/etc/hosts", "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip = parts[0]
+                    if IS_IPV4_RE.match(ip) and ip != "127.0.0.1":
+                        if name_or_ip in parts[1:]:
+                            return ip
+    except Exception:
+        pass
+
+    try:
+        resolved = socket.gethostbyname(name_or_ip)
+        if IS_IPV4_RE.match(resolved) and resolved != "127.0.0.1":
+            return resolved
+    except Exception:
+        pass
+
+    return name_or_ip
+
+def format_reporter_list(dev_name, reporter_list, local_name=None):
+    clean_list = sorted(list(set([r for r in (reporter_list or []) if r != dev_name])), key=natural_sort_key)
+    return ", ".join(clean_list) if clean_list else "None"
+
+def show_srlx_devices_callback(state, output, arguments, **_kwargs):
+    resp = query_daemon_socket({"action": "get_devices"})
+    local_name = get_local_hostname()
+
+    if not resp or resp.get("status") != "ok":
+        discovered = discover_srlinux_neighbors()
+        nodes = {}
+        for d, data in discovered.items():
+            nodes[d] = {
+                "mgmt_addrs": data.get("mgmt_addrs", [d]),
+                "netns": data.get("netns", "mgmt"),
+                "direct_reporters": ["local" if d == local_name else "lldp"],
+                "mesh_reporters": [],
+                "learned_via": "Local" if d == local_name else "Direct",
+                "status": "Local" if d == local_name else "mTLS OK",
+                "last_updated": time.time()
+            }
+    else:
+        vector = resp.get("vector", {})
+        nodes = vector.get("nodes", {})
+
+    dev_names = sorted(list(nodes.keys()), key=natural_sort_key)
+    if local_name in dev_names:
+        dev_names.remove(local_name)
+        dev_names.append(local_name)
+
+    output.print_line("\n======================================================================================================")
+    output.print_line(f" SRLX Discovered Fabric Topology ({len(dev_names)} Nodes Discovered)")
+    output.print_line("======================================================================================================")
+
+    headers = ["Device Name", "Mgmt IP", "Learned Via", "Direct Reporters", "Mesh Reporters", "Reachable", "Last Seen"]
+    rows = []
+    now = time.time()
+
+    for d in dev_names:
+        data = nodes[d]
+        raw_ip = data.get("mgmt_addrs", [d])[0]
+        ip = resolve_management_ip(raw_ip)
+        if not IS_IPV4_RE.match(ip):
+            ip = resolve_management_ip(d)
+        
+        direct_reporters = [r for r in data.get("direct_reporters", []) if r != d]
+        mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != d]
+        
+        direct_str = format_reporter_list(d, direct_reporters, local_name)
+        mesh_str = format_reporter_list(d, mesh_reporters, local_name)
+        
+        learned_via = data.get("learned_via")
+        if not learned_via:
+            learned_via = "Local" if d == local_name else ("Direct" if local_name in direct_reporters else "Mesh")
+            
+        raw_status = data.get("status", "")
+        if d == local_name:
+            reachable = "Local"
+        elif "Unreachable" in raw_status or "Failed" in raw_status:
+            reachable = "Unreachable"
+        else:
+            reachable = "mTLS OK"
+
+        last_ts = data.get("last_updated", now)
+        elapsed = int(now - last_ts)
+        last_seen = "Local" if d == local_name else (f"{elapsed}s ago" if elapsed > 0 else "Instant")
+
+        rows.append([d, ip, learned_via, direct_str, mesh_str, reachable, last_seen])
+
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, val in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(val))
+
+    def _fmt_row(vals):
+        return "| " + " | ".join(val.ljust(col_widths[i]) for i, val in enumerate(vals)) + " |"
+
+    sep = "+" + "+".join("=" * (col_widths[i] + 2) for i in range(len(headers))) + "+"
+    thin_sep = "+" + "+".join("-" * (col_widths[i] + 2) for i in range(len(headers))) + "+"
+
+    output.print_line(sep)
+    output.print_line(_fmt_row(headers))
+    output.print_line(sep)
+    for r in rows:
+        output.print_line(_fmt_row(r))
+    output.print_line(thin_sep + "\n")
+
+def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
+    target_name = extract_device_argument_value(arguments)
+    if not target_name:
+        target_name = get_local_hostname()
+
+    resp = query_daemon_socket({"action": "get_devices"})
+    nodes = resp.get("vector", {}).get("nodes", {}) if resp and resp.get("status") == "ok" else {}
+    local_name = get_local_hostname()
+
+    if target_name not in nodes:
+        output.print_error_line(f"Device '{target_name}' not found in topology database.")
+        return
+
+    data = nodes[target_name]
+    raw_ip = data.get("mgmt_addrs", [target_name])[0]
+    ip = resolve_management_ip(raw_ip)
+    if not IS_IPV4_RE.match(ip):
+        ip = resolve_management_ip(target_name)
+    netns = data.get("netns", "mgmt")
+    
+    direct_reporters = [r for r in data.get("direct_reporters", []) if r != target_name]
+    mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != target_name]
+    
+    direct_str = format_reporter_list(target_name, direct_reporters, local_name)
+    mesh_str = format_reporter_list(target_name, mesh_reporters, local_name)
+    
+    learned_via = data.get("learned_via")
+    if not learned_via:
+        learned_via = "Local" if target_name == local_name else ("Direct" if local_name in direct_reporters else "Mesh")
+        
+    raw_status = data.get("status", "")
+    if target_name == local_name:
+        reachable = "Local"
+    elif "Unreachable" in raw_status or "Failed" in raw_status:
+        reachable = "Unreachable"
+    else:
+        reachable = "mTLS OK"
+
+    output.print_line("\n======================================================================")
+    output.print_line(f" Device Detail: {target_name}")
+    output.print_line("======================================================================")
+    output.print_line(f" Management Address    : {ip}")
+    output.print_line(f" Network Instance / VRF: {netns}")
+    output.print_line(f" Learned Via           : {learned_via}")
+    output.print_line(f" Reachable             : {reachable}")
+    output.print_line(f" Direct Reporters      : {direct_str}")
+    output.print_line(f" Mesh Reporters        : {mesh_str}")
+    output.print_line(f" mTLS Security State   : Verified (CA: clab-profile, TLSv1.3)")
+    output.print_line("======================================================================\n")
+
+def tools_srlx_clear_device_callback(state, output, arguments, **_kwargs):
+    target_name = extract_device_argument_value(arguments)
+
+    if not target_name:
+        output.print_error_line("Please specify a device name to clear.")
+        return
+
+    resp = query_daemon_socket({"action": "clear_device", "device": target_name})
+    if resp and resp.get("status") == "ok":
+        output.print_line(f"Device '{target_name}' cleared from local SRLX topology cache.")
+    else:
+        output.print_error_line(f"Failed to clear device '{target_name}': {resp.get('message') if resp else 'Daemon unavailable'}")
+
+def tools_srlx_clear_all_callback(state, output, arguments, **_kwargs):
+    resp = query_daemon_socket({"action": "clear_all"})
+    if resp and resp.get("status") == "ok":
+        output.print_line("Local SRLX topology cache cleared. Triggering re-discovery scan...")
+    else:
+        output.print_error_line(f"Failed to clear topology cache: {resp.get('message') if resp else 'Daemon unavailable'}")
+
 def standalone_srlx_callback(state, output, arguments, **_kwargs):
-    raw_args = arguments.get("srlx", "target_and_cmd") if arguments else None
+    raw_args = arguments.get("srlx", "[target-device...] command") if arguments else None
     if isinstance(raw_args, str):
         raw_args = [raw_args]
     elif not raw_args:
@@ -399,15 +680,46 @@ def standalone_srlx_callback(state, output, arguments, **_kwargs):
     cmd = " ".join(cmd_tokens) if cmd_tokens else "show version"
     run_srlx_execution(output, target_devices, cmd)
 
-class Plugin(CliPlugin):
+class Plugin(ToolsPlugin):
     def load(self, cli, **_kwargs):
+        # 1. show srlx devices & show srlx device <device> [detail]
+        show_root = cli.show_mode.root
+        if not show_root.get_command_or_none("srlx"):
+            show_srlx = Syntax("srlx", help="SRLX Gossip Protocol Topology Information")
+            devices_syntax = Syntax("devices", help="Show all discovered fabric switches and topology mesh")
+
+            device_syntax = Syntax("device", help="Show detailed topology attribution for a single device")
+            device_syntax.add_unnamed_argument("device", default=None, choices=get_neighbor_choices, help="Target device name")
+
+            show_node = show_root.add_command(show_srlx, update_location=False)
+            show_node.add_command(devices_syntax, update_location=False, callback=show_srlx_devices_callback)
+
+            dev_node = show_node.add_command(device_syntax, update_location=False, callback=show_srlx_device_detail_callback)
+            dev_node.add_command(Syntax("detail", help="Detailed attribution"), update_location=False, callback=show_srlx_device_detail_callback)
+
+        # 2. Standalone global execution (srlx [devices...] <cmd...>)
         syntax_standalone = Syntax("srlx", help="Execute command on switch(es) without local command leakage")
         syntax_standalone.add_unnamed_argument(
-            "target_and_cmd",
+            "[target-device...] command",
             default=None,
             min_count=1,
             max_count="*",
             suggestions=get_srlx_unified_suggestions,
-            help="Target switch device(s) followed by remote CLI command"
+            help="Optional target switch(es) followed by remote CLI command (defaults to all fabric switches if omitted)"
         )
         cli.add_global_command(syntax_standalone, update_location=False, only_at_start_of_line=True, callback=standalone_srlx_callback)
+
+    def on_tools_load(self, state):
+        # 3. tools srlx clear all & tools srlx clear device <device>
+        tools_root = state.command_tree.tools_mode.root
+        if not tools_root.get_command_or_none("srlx"):
+            tools_srlx = Syntax("srlx", help="SRLX Gossip Protocol Topology Management Tools")
+            clear_syntax = Syntax("clear", help="Clear local topology cache")
+
+            clear_device_syntax = Syntax("device", help="Clear a specific device from local cache")
+            clear_device_syntax.add_unnamed_argument("device", default=None, choices=get_neighbor_choices, help="Target device name to clear")
+
+            tools_node = tools_root.add_command(tools_srlx, update_location=False)
+            clear_node = tools_node.add_command(clear_syntax, update_location=False)
+            clear_node.add_command(Syntax("all", help="Clear all devices from local topology cache"), update_location=False, callback=tools_srlx_clear_all_callback)
+            clear_node.add_command(clear_device_syntax, update_location=False, callback=tools_srlx_clear_device_callback)

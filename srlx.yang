@@ -1,0 +1,53 @@
+module srlx {
+    yang-version 1.1;
+    namespace "urn:nokia.com:srlinux:srlx";
+    prefix srlx;
+
+    organization "Nokia";
+    contact "andy.whitaker@nokia.com";
+    description "YANG model for SRLX Topology Gossip Protocol State Datastore";
+
+    revision 2026-08-13 {
+        description "Initial revision for srlx topology state.";
+    }
+
+    container srlx {
+        config false;
+        description "Top-level container for SRLX topology gossip state";
+
+        list node {
+            key "name";
+            description "Discovered mesh topology switch node";
+
+            leaf name {
+                type string;
+                description "Switch hostname";
+            }
+
+            leaf mgmt-address {
+                type string;
+                description "Primary management IP address";
+            }
+
+            leaf netns {
+                type string;
+                description "Network instance / VRF name";
+            }
+
+            leaf status {
+                type string;
+                description "Reachability status (Local, Direct mTLS OK, Mesh Reachable, Unreachable)";
+            }
+
+            leaf-list direct-reporters {
+                type string;
+                description "List of switch hostnames reporting direct LLDP adjacency";
+            }
+
+            leaf last-updated {
+                type string;
+                description "Timestamp of last state update";
+            }
+        }
+    }
+}

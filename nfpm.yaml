@@ -1,0 +1,39 @@
+name: "srlx"
+arch: "all"
+platform: "linux"
+version: "0.0.1"
+section: "default"
+priority: "optional"
+maintainer: "Andy Whitaker <andy.whitaker@nokia.com>"
+license: "MIT"
+description: "SR Linux Standalone CLI & Topology Gossip Protocol Suite"
+
+contents:
+  - src: "srlx-daemon.py"
+    dst: "/opt/srlx/bin/srlx-daemon.py"
+    file_info:
+      mode: 0755
+  - src: "scripts/get_vector.py"
+    dst: "/opt/srlx/bin/get_vector.py"
+    file_info:
+      mode: 0755
+  - src: "srlx.yang"
+    dst: "/opt/srlx/models/srlx.yang"
+    file_info:
+      mode: 0644
+  - src: "srlx.yml"
+    dst: "/etc/opt/srlinux/appmgr/srlx.yml"
+    file_info:
+      mode: 0644
+  - src: "srlx.py"
+    dst: "/opt/srlx/cli/srlx.py"
+    file_info:
+      mode: 0644
+  - src: "LICENSE"
+    dst: "/opt/srlx/LICENSE"
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: "scripts/postinstall.sh"
+  preremove: "scripts/prerm.sh"
