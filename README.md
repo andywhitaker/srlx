@@ -1,4 +1,4 @@
-# SR Linux `srlx` Standalone CLI & Topology Gossip Protocol Suite
+# SR Linux `srlx` Multi-Node Command Executor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
