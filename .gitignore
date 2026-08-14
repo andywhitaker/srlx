@@ -1,2 +1,3 @@
 clab-*/
 *.deb
+/lab/tls

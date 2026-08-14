@@ -32,16 +32,14 @@ Download the latest `.deb` package from GitHub Releases or build it locally from
 ```
 
 ### 2. Generate Lab CA & Deploy Topology
-Navigate to the `lab/` folder, generate the CA certificates using Containerlab, and deploy the test topology:
+Generate the CA certificates using Containerlab, and deploy the test topology:
 
 ```bash
-cd lab/
-
 # Generate CA certificate into lab/tls/
-sudo containerlab tools cert ca create -p tls
+containerlab tools cert ca create -p lab/tls
 
 # Deploy the 5-node test topology
-sudo containerlab deploy -t srlx-test.clab.yaml
+containerlab deploy -t lab/srlx-test.clab.yaml
 ```
 
 ### 3. Install `srlx` on the Switches
@@ -49,7 +47,7 @@ Copy the package to all switches in the topology and install:
 
 ```bash
 for node in srl1 srl2 srl3 srl4 srl5; do
-  docker cp ../srlx_0.0.2.deb $node:/tmp/srlx_0.0.2.deb
+  docker cp srlx_0.0.2.deb $node:/tmp/srlx_0.0.2.deb
   docker exec $node dpkg -i /tmp/srlx_0.0.2.deb
 done
 ```
