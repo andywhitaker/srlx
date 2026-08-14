@@ -144,6 +144,34 @@ A:admin@leaf1# commit stay
 - **CA Trust Bundle**: `$SRLX_CA_CERT` $\to$ `~/.srlx.json` (`ca_cert`) $\to$ `/etc/opt/srlinux/tls/ca.pem`
 - **Node Certificate & Key**: `$SRLX_CLIENT_CERT` / `$SRLX_CLIENT_KEY` $\to$ `clab-profile` (`.pem`/`.key.pem`) $\to$ `__default__` (`.pem`/`.key.pem`) $\to$ auto-pairing any matching certificate/key in `/etc/opt/srlinux/tls/`
 
+### Credential Resolution & Authentication Hierarchy
+
+When executing commands across remote switches or gossiping topology updates, `srlx` resolves administrative credentials in the following strict order of precedence:
+
+1. **Priority 1 (`~/.netrc` file)**:
+   If `~/.netrc` (or `/root/.netrc` for the background daemon) exists, `srlx` uses credentials from the .netrc file.
+2. **Priority 2 (Environment Variables)**:
+   If no `.netrc` file is present, `srlx` inspects the execution environment for:
+   - Username: `$SRLX_USER`
+   - Password: `$SRLX_PASS` or `$SRLX_PASSWORD`
+3. **Priority 3 (Configuration File `~/.srlx.json`)**:
+   If environment variables are not set, `srlx` inspects `~/.srlx.json` (or `/root/.srlx.json`) for `"username"` and `"password"` JSON fields.
+4. **Priority 4 (Default Fallback)**:
+   If no other credential source is configured, `srlx` defaults to standard SR Linux lab credentials:
+   - Username: `admin`
+   - Password: `NokiaSrl1!`
+
+> [!IMPORTANT]
+> **Zero-Trust Pre-Auth Guarantee**: Credentials (whether loaded from `.netrc`, environment variables, configuration files, or defaults) **are never sent to a target host unless 2-way mTLS certificate verification completes successfully first**. If a host presents an untrusted certificate or fails Root CA validation, the TLS handshake is aborted (Exit Code 60) before any HTTP authentication headers, credentials, or command payloads are transmitted.
+
+> [!WARNING]
+> **Securing Stored Credentials & `.netrc` Permissions**:
+> - **Strict `.netrc` Permissions Enforced**: We **will not read** a `~/.netrc` file if its permissions allow group or world read access. You must secure it with strict permissions:
+>   ```bash
+>   chmod 600 ~/.netrc
+>   ```
+> - **Protecting Files on Network Equipment**: Storing passwords in configuration files (`.netrc`, `.srlx.json`) on shared network switches introduces security exposure if files are not strictly protected. Ensure any credential files are owned by the intended user/root with `0600` permissions, and use dedicated, least-privilege service accounts rather than root/superuser credentials whenever possible. In short, standard linux security risks and recommendations for credentials in files apply.
+
 ---
 
 ## Usage Examples
