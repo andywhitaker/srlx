@@ -2,6 +2,6 @@ srlx:
   path: /opt/srlx/bin
   launch-command: ./srlx-daemon.py
   search-command: srlx-daemon
-  version: 0.0.1
+  version: 0.0.2
   failure-threshold: 3
   yang-files: [/opt/srlx/models/srlx.yang]

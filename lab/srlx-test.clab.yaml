@@ -1,0 +1,39 @@
+name: srlx-test
+prefix: ""
+settings:
+  certificate-authority:
+    cert: tls/ca.pem
+    key: tls/ca.key
+topology:
+  kinds:
+    nokia_srlinux:
+      startup-config: startup/__clabNodeName__.partial.srl.cfg
+      binds:
+        - tls/ca.pem:/etc/opt/srlinux/tls/ca.pem:ro
+  nodes:
+    srl1:
+      kind: nokia_srlinux
+      type: ixr-d2l
+      image: ghcr.io/nokia/srlinux:latest
+    srl2:
+      kind: nokia_srlinux
+      type: ixr-d2l
+      image: ghcr.io/nokia/srlinux:latest
+    srl3:
+      kind: nokia_srlinux
+      type: ixr-d2l
+      image: ghcr.io/nokia/srlinux:latest
+    srl4:
+      kind: nokia_srlinux
+      type: ixr-d2l
+      image: ghcr.io/nokia/srlinux:latest
+    srl5:
+      kind: nokia_srlinux
+      type: ixr-d2l
+      image: ghcr.io/nokia/srlinux:latest
+
+  links:
+    - endpoints: [ "srl1:e1-2", "srl2:e1-1" ]
+    - endpoints: [ "srl2:e1-2", "srl3:e1-1" ]
+    - endpoints: [ "srl3:e1-2", "srl4:e1-1" ]
+    - endpoints: [ "srl4:e1-2", "srl5:e1-1" ]

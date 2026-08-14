@@ -258,19 +258,105 @@ def get_auth_curl_flags():
     password = password or "NokiaSrl1!"
     return ["-u", f"{user}:{password}"]
 
+def resolve_tls_certificates():
+    config_data = {}
+    config_path = os.path.expanduser("~/.srlx.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                config_data = json.load(f)
+        except Exception:
+            pass
+
+    ca_path = os.environ.get("SRLX_CA_CERT") or config_data.get("ca_cert") or config_data.get("ca_file")
+    if not ca_path or not os.path.exists(ca_path):
+        for candidate in ["/etc/opt/srlinux/tls/ca.pem"]:
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                ca_path = candidate
+                break
+
+    client_cert = os.environ.get("SRLX_CLIENT_CERT") or config_data.get("client_cert")
+    client_key = os.environ.get("SRLX_CLIENT_KEY") or config_data.get("client_key")
+    profile_name = "Custom" if client_cert else None
+
+    if not (client_cert and client_key and os.path.exists(client_cert) and os.path.exists(client_key)):
+        for prof in ["clab-profile", "__default__"]:
+            c_cand = f"/etc/opt/srlinux/tls/{prof}.pem"
+            k_cand = f"/etc/opt/srlinux/tls/{prof}.key.pem"
+            if os.path.exists(c_cand) and os.path.exists(k_cand):
+                client_cert, client_key, profile_name = c_cand, k_cand, prof
+                break
+
+        if not client_cert and os.path.exists("/etc/opt/srlinux/tls"):
+            try:
+                for fname in os.listdir("/etc/opt/srlinux/tls"):
+                    if fname.endswith(".pem") and not fname.endswith(".key.pem") and not fname.endswith(".ca.pem") and fname != "ca.pem":
+                        base = fname[:-4]
+                        k_cand = os.path.join("/etc/opt/srlinux/tls", f"{base}.key.pem")
+                        c_cand = os.path.join("/etc/opt/srlinux/tls", fname)
+                        if os.path.exists(k_cand):
+                            client_cert, client_key, profile_name = c_cand, k_cand, base
+                            break
+            except Exception:
+                pass
+
+    return {
+        "ca_cert": ca_path if (ca_path and os.path.exists(ca_path)) else None,
+        "client_cert": client_cert if (client_cert and os.path.exists(client_cert)) else None,
+        "client_key": client_key if (client_key and os.path.exists(client_key)) else None,
+        "profile_name": profile_name or "System"
+    }
+
 def exec_curl_jsonrpc(host, commands, netns="mgmt", timeout=5):
     target_netns = f"srbase-{netns}" if netns != "default" else "srbase"
     auth_flags = get_auth_curl_flags()
+    tls_info = resolve_tls_certificates()
+    is_local = host in ("127.0.0.1", "localhost", "::1")
+
+    if is_local:
+        cmd_args = [
+            "sudo", "-n", "ip", "netns", "exec", target_netns,
+            "curl", "-s"
+        ] + auth_flags + [
+            "-X", "POST", "http://127.0.0.1:80/jsonrpc",
+            "-H", "Content-Type: application/json",
+            "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "get", "params": {"commands": commands}})
+        ]
+        try:
+            res = subprocess.check_output(cmd_args, stderr=subprocess.DEVNULL, timeout=timeout)
+            data = json.loads(res.decode())
+            if "result" in data:
+                return data["result"]
+        except Exception:
+            pass
+
+        cmd_args_ssl = [
+            "sudo", "-n", "ip", "netns", "exec", target_netns,
+            "curl", "-k", "-s"
+        ] + auth_flags + [
+            "-X", "POST", "https://127.0.0.1:443/jsonrpc",
+            "-H", "Content-Type: application/json",
+            "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "get", "params": {"commands": commands}})
+        ]
+        try:
+            res = subprocess.check_output(cmd_args_ssl, stderr=subprocess.DEVNULL, timeout=timeout)
+            return json.loads(res.decode()).get("result", [])
+        except Exception:
+            return []
+
+    ca_file = tls_info.get("ca_cert")
+    if not ca_file:
+        return []
 
     cmd_args = [
         "sudo", "-n", "ip", "netns", "exec", target_netns,
-        "curl", "-k", "-s"
+        "curl", "-s",
+        "--cacert", ca_file
     ]
+    if tls_info.get("client_cert") and tls_info.get("client_key"):
+        cmd_args.extend(["--cert", tls_info["client_cert"], "--key", tls_info["client_key"]])
     cmd_args.extend(auth_flags)
     cmd_args.extend([
-        "--cacert", "/etc/opt/srlinux/tls/ca.pem",
-        "--cert", "/etc/opt/srlinux/tls/clab-profile.pem",
-        "--key", "/etc/opt/srlinux/tls/clab-profile.key.pem",
         "-X", "POST", f"https://{host}/jsonrpc",
         "-H", "Content-Type: application/json",
         "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "get", "params": {"commands": commands}})
@@ -300,16 +386,42 @@ def fetch_remote_vector(host, netns="mgmt"):
     cmd_str = "bash /opt/srlinux/python/virtual-env/bin/python3 /opt/srlx/bin/get_vector.py"
     target_netns = f"srbase-{netns}" if netns != "default" else "srbase"
     auth_flags = get_auth_curl_flags()
+    tls_info = resolve_tls_certificates()
+    is_local = host in ("127.0.0.1", "localhost", "::1")
+
+    if is_local:
+        cmd_args = [
+            "sudo", "-n", "ip", "netns", "exec", target_netns,
+            "curl", "-s"
+        ] + auth_flags + [
+            "-X", "POST", "http://127.0.0.1:80/jsonrpc",
+            "-H", "Content-Type: application/json",
+            "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "cli", "params": {"commands": [cmd_str], "output-format": "text"}})
+        ]
+        try:
+            res = subprocess.check_output(cmd_args, stderr=subprocess.DEVNULL, timeout=5)
+            data = json.loads(res.decode())
+            if "result" in data and data["result"]:
+                parsed = json.loads(data["result"][0].strip())
+                if parsed.get("status") == "ok":
+                    return parsed.get("vector")
+        except Exception:
+            pass
+        return None
+
+    ca_file = tls_info.get("ca_cert")
+    if not ca_file:
+        return None
 
     cmd_args = [
         "sudo", "-n", "ip", "netns", "exec", target_netns,
-        "curl", "-k", "-s"
+        "curl", "-s",
+        "--cacert", ca_file
     ]
+    if tls_info.get("client_cert") and tls_info.get("client_key"):
+        cmd_args.extend(["--cert", tls_info["client_cert"], "--key", tls_info["client_key"]])
     cmd_args.extend(auth_flags)
     cmd_args.extend([
-        "--cacert", "/etc/opt/srlinux/tls/ca.pem",
-        "--cert", "/etc/opt/srlinux/tls/clab-profile.pem",
-        "--key", "/etc/opt/srlinux/tls/clab-profile.key.pem",
         "-X", "POST", f"https://{host}/jsonrpc",
         "-H", "Content-Type: application/json",
         "-d", json.dumps({
