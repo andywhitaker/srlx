@@ -610,8 +610,14 @@ def _raw_exec_remote_cmd(host, command, target_netns="mgmt", output_format="text
         err_text = ""
         if code == 60:
             err_text = f"Security Alert: Untrusted Server CA / mTLS Verification Failed on {host}. Connection aborted before sending credentials."
+        elif code == 35:
+            err_text = f"Security Alert: mTLS Handshake / TLS Connect Failed on {host} (exit code 35). Remote host certificate invalid or rejected. Connection aborted before sending credentials."
+        elif code == 58:
+            err_text = f"Security Alert: Problem with local client certificate/key on {host} (exit code 58)."
         elif code == 56:
-            err_text = f"Client mTLS Verification Failed on {host}: Remote server rejected client certificate."
+            err_text = f"Client mTLS Verification Failed on {host}: Remote server rejected client certificate or connection reset."
+        elif code == 77:
+            err_text = f"Security Alert: Problem reading SSL CA cert bundle on {host} (exit code 77)."
         elif code in (7, 28):
             err_text = f"Connection Failed on {host}: Host unreachable or timed out."
         elif "AuthenticationFailed" in stderr_msg or "401" in stderr_msg:
@@ -930,6 +936,8 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
     ca_desc = os.path.basename(tls_info['ca_cert']) if tls_info.get('ca_cert') else "None"
     profile_desc = tls_info.get('profile_name', 'System')
 
+    is_mtls_verified = (reachable != "Unreachable")
+
     if requested_fmt == "json":
         detail_dict = {
             "device_name": target_name,
@@ -940,10 +948,10 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
             "direct_reporters": direct_reporters,
             "mesh_reporters": mesh_reporters,
             "mtls_security_state": {
-                "verified": True,
+                "verified": is_mtls_verified,
                 "ca_certificate": ca_desc,
                 "tls_profile": profile_desc,
-                "protocol": "TLSv1.3"
+                "protocol": "TLSv1.3" if is_mtls_verified else "None"
             }
         }
         output.print_line(json.dumps(detail_dict, indent=2))
@@ -958,15 +966,17 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
             "direct_reporters": direct_reporters,
             "mesh_reporters": mesh_reporters,
             "mtls_security_state": {
-                "verified": True,
+                "verified": is_mtls_verified,
                 "ca_certificate": ca_desc,
                 "tls_profile": profile_desc,
-                "protocol": "TLSv1.3"
+                "protocol": "TLSv1.3" if is_mtls_verified else "None"
             }
         }
         output.print_line("---")
         output.print_line(dump_simple_yaml({"device_detail": detail_dict}))
         return
+
+    sec_status_str = f"Verified (CA: {ca_desc}, Profile: {profile_desc}, TLSv1.3)" if is_mtls_verified else f"Failed / Unreachable (CA: {ca_desc}, Profile: {profile_desc})"
 
     output.print_line("\n======================================================================")
     output.print_line(f" Device Detail: {target_name}")
@@ -977,7 +987,7 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
     output.print_line(f" Reachable             : {reachable}")
     output.print_line(f" Direct Reporters      : {direct_str}")
     output.print_line(f" Mesh Reporters        : {mesh_str}")
-    output.print_line(f" mTLS Security State   : Verified (CA: {ca_desc}, Profile: {profile_desc}, TLSv1.3)")
+    output.print_line(f" mTLS Security State   : {sec_status_str}")
     output.print_line("======================================================================\n")
 
 def tools_srlx_clear_device_callback(state, output, arguments, **_kwargs):

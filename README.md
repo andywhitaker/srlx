@@ -47,8 +47,8 @@ Copy the package to all switches in the topology and install:
 
 ```bash
 for node in srl1 srl2 srl3 srl4 srl5; do
-  docker cp srlx_0.0.2.deb $node:/tmp/srlx_0.0.2.deb
-  docker exec $node dpkg -i /tmp/srlx_0.0.2.deb
+  docker cp srlx_0.0.3.deb $node:/tmp/srlx_0.0.3.deb
+  docker exec $node dpkg -i /tmp/srlx_0.0.3.deb
 done
 ```
 
@@ -125,7 +125,7 @@ LLDP and L2 discovery protocols are unauthenticated. Firing HTTP Basic Authentic
          binds:
            - tls/ca.pem:/etc/opt/srlinux/tls/ca.pem:ro
    ```
-3. **Deploy & Install Package**: Deploy the lab (`sudo clab deploy -t ...`) and install `srlx` (`dpkg -i srlx_0.0.2.deb`). The post-installation script automatically detects the active TLS profile (`clab-profile` or `__default__`), configures the trust anchor from `/etc/opt/srlinux/tls/ca.pem`, enables client authentication (`authenticate-client true`), and reloads the JSON-RPC listener.
+3. **Deploy & Install Package**: Deploy the lab (`sudo clab deploy -t ...`) and install `srlx` (`dpkg -i srlx_0.0.3.deb`). The post-installation script automatically detects the active TLS profile (`clab-profile` or `__default__`), configures the trust anchor from `/etc/opt/srlinux/tls/ca.pem`, enables client authentication (`authenticate-client true`), and reloads the JSON-RPC listener.
 
 ### Manual SR Linux CLI Configuration
 If configuring SR Linux manually via `sr_cli`:
@@ -299,13 +299,13 @@ Package the suite into a clean, standalone Debian archive using Docker and nFPM:
 ```bash
 ./build-deb.sh
 ```
-*Generates `srlx_0.0.2.deb` in the current directory.*
+*Generates `srlx_0.0.3.deb` in the current directory.*
 
 ### 2. Deploy to Switches
 Copy and install the package on target SR Linux switches:
 
 ```bash
-dpkg -i srlx_0.0.2.deb
+dpkg -i srlx_0.0.3.deb
 ```
 *The installer automatically links CLI plugins, configures mTLS client authentication, reloads `app_mgr`, and launches the daemon.*
 

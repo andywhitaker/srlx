@@ -62,7 +62,8 @@ class TopologyGraph:
                 "reporters": {self.local_hostname: {"type": "direct", "timestamp": time.time()}},
                 "status": "Local",
                 "last_updated": time.time(),
-                "last_probe_ok": time.time()
+                "last_probe_ok": time.time(),
+                "is_direct_lldp": False
             }
 
     def update_direct_lldp(self, raw_neighbors, port_to_netns):
@@ -88,25 +89,24 @@ class TopologyGraph:
                         "mgmt_addrs": clean_addrs,
                         "netns": netns,
                         "reporters": {},
-                        "status": "Direct mTLS OK",
+                        "status": "Pending",
                         "last_updated": now,
-                        "last_probe_ok": now
+                        "last_probe_ok": 0.0,
+                        "is_direct_lldp": True
                     }
                 else:
                     if clean_addrs and IS_IPV4_RE.match(clean_addrs[0]):
                         self.nodes[sys_name]["mgmt_addrs"] = clean_addrs
                     self.nodes[sys_name]["netns"] = netns
-                    self.nodes[sys_name]["status"] = "Direct mTLS OK"
+                    self.nodes[sys_name]["is_direct_lldp"] = True
+                    self.nodes[sys_name]["last_updated"] = now
 
-                self.nodes[sys_name]["reporters"][self.local_hostname] = {"type": "direct", "timestamp": now}
-                self.nodes[sys_name]["last_updated"] = now
-                self.nodes[sys_name]["last_probe_ok"] = now
-
-            # Clean up local_hostname from reporters for switches no longer in LLDP
+            # Clean up direct flag for switches no longer in LLDP
             for dev_name, data in list(self.nodes.items()):
                 if dev_name == self.local_hostname:
                     continue
                 if dev_name not in current_direct_names:
+                    data["is_direct_lldp"] = False
                     data.get("reporters", {}).pop(self.local_hostname, None)
 
     def merge_remote_vector(self, remote_node, vector):
@@ -114,8 +114,11 @@ class TopologyGraph:
         with self.lock:
             remote_nodes = vector.get("nodes", {})
             for dev_name, rdata in remote_nodes.items():
+                if dev_name == self.local_hostname:
+                    continue
+
                 r_direct = rdata.get("direct_reporters", [])
-                r_mesh = rdata.get("mesh_reporters", [])
+                r_status = rdata.get("status", "Unreachable")
                 r_mgmt_raw = rdata.get("mgmt_addrs", [])
                 clean_mgmt = [resolve_management_ip(m) for m in r_mgmt_raw if IS_IPV4_RE.match(resolve_management_ip(m))]
                 if not clean_mgmt:
@@ -127,30 +130,42 @@ class TopologyGraph:
                         "mgmt_addrs": clean_mgmt,
                         "netns": r_netns,
                         "reporters": {},
-                        "status": "Local" if dev_name == self.local_hostname else "Mesh Reachable",
+                        "status": r_status,
                         "last_updated": now,
-                        "last_probe_ok": now if dev_name == self.local_hostname else 0.0
+                        "last_probe_ok": 0.0,
+                        "is_direct_lldp": False
                     }
+                else:
+                    if clean_mgmt and IS_IPV4_RE.match(clean_mgmt[0]):
+                        self.nodes[dev_name]["mgmt_addrs"] = clean_mgmt
+                    self.nodes[dev_name]["netns"] = r_netns
 
-                # 1. Merge direct reporters reported by remote node
+                is_direct = self.nodes[dev_name].get("is_direct_lldp", False)
+
+                # Update reporters from remote node
+                if remote_node in r_direct and r_status != "Unreachable":
+                    self.nodes[dev_name]["reporters"][remote_node] = {"type": "direct", "timestamp": now}
+                elif r_status != "Unreachable" and len(r_direct) > 0:
+                    if remote_node not in self.nodes[dev_name]["reporters"] or self.nodes[dev_name]["reporters"][remote_node]["type"] != "direct":
+                        self.nodes[dev_name]["reporters"][remote_node] = {"type": "mesh", "timestamp": now}
+                else:
+                    self.nodes[dev_name]["reporters"].pop(remote_node, None)
+
+                # Merge other direct reporters if reported as active
                 for dr in r_direct:
-                    if dr != dev_name:
+                    if dr != dev_name and dr != self.local_hostname and r_status != "Unreachable":
                         self.nodes[dev_name]["reporters"][dr] = {"type": "direct", "timestamp": now}
 
-                # 2. Merge mesh reporters reported by remote node (if not already recorded as direct)
-                for mr in r_mesh:
-                    if mr != dev_name:
-                        if mr not in self.nodes[dev_name]["reporters"] or self.nodes[dev_name]["reporters"][mr]["type"] != "direct":
-                            self.nodes[dev_name]["reporters"][mr] = {"type": "mesh", "timestamp": now}
+                # Evaluate overall status for non-direct nodes
+                if not is_direct:
+                    has_direct_reps = any(info.get("type") == "direct" for r, info in self.nodes[dev_name]["reporters"].items() if r != dev_name)
+                    if not has_direct_reps:
+                        self.nodes[dev_name]["status"] = "Unreachable"
+                        self.nodes[dev_name]["reporters"] = {}
+                    else:
+                        self.nodes[dev_name]["status"] = "Mesh Reachable"
 
-                # 3. Also record remote_node itself as a reporter if it sent us this node
-                if remote_node != dev_name and remote_node not in self.nodes[dev_name]["reporters"]:
-                    self.nodes[dev_name]["reporters"][remote_node] = {"type": "mesh", "timestamp": now}
-
-                if clean_mgmt and IS_IPV4_RE.match(clean_mgmt[0]) and dev_name != self.local_hostname:
-                    self.nodes[dev_name]["mgmt_addrs"] = clean_mgmt
-                if dev_name != self.local_hostname:
-                    self.nodes[dev_name]["last_updated"] = now
+                self.nodes[dev_name]["last_updated"] = now
 
     def evaluate_reachability_and_purge(self, probe_func):
         now = time.time()
@@ -160,32 +175,56 @@ class TopologyGraph:
                 if dev_name == self.local_hostname:
                     continue
 
-                # Remove stale reporters (>90s old)
-                stale_reporters = [r for r, info in data.get("reporters", {}).items() if now - info.get("timestamp", 0) > 90]
+                # Remove stale reporters (>60s old)
+                stale_reporters = [r for r, info in data.get("reporters", {}).items() if now - info.get("timestamp", 0) > 60]
                 for r in stale_reporters:
                     data["reporters"].pop(r, None)
 
-                # Deletion Safeguard Algorithm:
-                # If no reporters report this node, probe directly before purging
-                if not data["reporters"]:
-                    nodes_to_probe.append((dev_name, data["mgmt_addrs"], data["netns"]))
+                # Direct LLDP neighbors must be probed
+                is_direct = data.get("is_direct_lldp", False)
+                if is_direct:
+                    nodes_to_probe.append((
+                        dev_name,
+                        data.get("mgmt_addrs", []),
+                        data.get("netns", "mgmt"),
+                        is_direct
+                    ))
+                else:
+                    # Non-direct nodes: if no direct reporters remain, mark Unreachable and clear mesh reporters
+                    has_direct_reps = any(info.get("type") == "direct" for r, info in data.get("reporters", {}).items() if r != dev_name)
+                    if not has_direct_reps:
+                        data["status"] = "Unreachable"
+                        data["reporters"] = {}
+                        if now - data.get("last_updated", 0) > 60:
+                            del self.nodes[dev_name]
 
-        # Execute direct probes outside lock
-        for dev_name, mgmt_addrs, netns in nodes_to_probe:
+        def _probe_node(item):
+            dev_name, mgmt_addrs, netns, is_direct = item
             target_host = mgmt_addrs[0] if mgmt_addrs else dev_name
             is_ok = probe_func(target_host, netns)
-            with self.lock:
-                if dev_name in self.nodes:
-                    if is_ok:
-                        self.nodes[dev_name]["status"] = "Direct mTLS OK"
-                        self.nodes[dev_name]["last_probe_ok"] = time.time()
-                        self.nodes[dev_name]["reporters"][self.local_hostname] = {"type": "direct", "timestamp": time.time()}
-                    else:
-                        # Direct probe failed and no reporters -> Purge or mark Unreachable
-                        if now - self.nodes[dev_name].get("last_updated", 0) > 60:
-                            del self.nodes[dev_name]
-                        else:
-                            self.nodes[dev_name]["status"] = "Unreachable"
+            return dev_name, is_ok, is_direct
+
+        probe_results = []
+        if nodes_to_probe:
+            with ThreadPoolExecutor(max_workers=min(len(nodes_to_probe), 10)) as executor:
+                probe_results = list(executor.map(_probe_node, nodes_to_probe))
+
+        with self.lock:
+            for dev_name, is_ok, is_direct in probe_results:
+                if dev_name not in self.nodes:
+                    continue
+                data = self.nodes[dev_name]
+                if is_ok:
+                    data["status"] = "Direct mTLS OK" if is_direct else "Mesh Reachable"
+                    data["last_probe_ok"] = now
+                    data["last_updated"] = now
+                    if is_direct:
+                        data["reporters"][self.local_hostname] = {"type": "direct", "timestamp": now}
+                else:
+                    data["status"] = "Unreachable"
+                    data.get("reporters", {}).pop(self.local_hostname, None)
+                    if not is_direct and not data.get("reporters") and (now - data.get("last_updated", 0) > 60):
+                        del self.nodes[dev_name]
 
     def clear_device(self, dev_name):
         with self.lock:
@@ -205,24 +244,28 @@ class TopologyGraph:
             nodes_export = {}
             for dev_name, data in self.nodes.items():
                 reporters_dict = data.get("reporters", {})
-                direct_reporters = [r for r, info in reporters_dict.items() if info.get("type") == "direct"]
-                mesh_reporters = [r for r, info in reporters_dict.items() if info.get("type") == "mesh"]
+                direct_reporters = [r for r, info in reporters_dict.items() if info.get("type") == "direct" and r != dev_name]
+                mesh_reporters = [r for r, info in reporters_dict.items() if info.get("type") == "mesh" and r != dev_name and r not in direct_reporters]
 
+                raw_status = data.get("status", "Unreachable")
                 if dev_name == self.local_hostname:
                     learned_via = "Local"
                     reachable = "Local"
-                elif self.local_hostname in direct_reporters or len(direct_reporters) > 0:
-                    learned_via = "Direct" if self.local_hostname in direct_reporters else "Mesh"
-                    reachable = "Unreachable" if data["status"] == "Unreachable" else "mTLS OK"
+                elif self.local_hostname in direct_reporters:
+                    learned_via = "Direct"
+                    reachable = "Unreachable" if ("Unreachable" in raw_status or "Failed" in raw_status) else "mTLS OK"
+                elif len(direct_reporters) > 0:
+                    learned_via = "Mesh"
+                    reachable = "Unreachable" if ("Unreachable" in raw_status or "Failed" in raw_status) else "mTLS OK"
                 else:
                     learned_via = "Mesh"
-                    reachable = "Unreachable" if data["status"] == "Unreachable" else "mTLS OK"
+                    reachable = "Unreachable"
 
                 nodes_export[dev_name] = {
                     "mgmt_addrs": data["mgmt_addrs"],
                     "netns": data["netns"],
                     "direct_reporters": direct_reporters,
-                    "mesh_reporters": mesh_reporters,
+                    "mesh_reporters": mesh_reporters if reachable != "Unreachable" else [],
                     "learned_via": learned_via,
                     "status": reachable,
                     "last_updated": data["last_updated"]
@@ -539,10 +582,13 @@ class SRLXDaemon:
             elif action == "clear_device":
                 dev = req.get("device")
                 ok = self.graph.clear_device(dev)
+                self.scan_local_lldp()
+                self.graph.evaluate_reachability_and_purge(probe_mtls_reachability)
                 resp = {"status": "ok" if ok else "error", "message": f"Device {dev} cleared" if ok else f"Device {dev} not found"}
             elif action == "clear_all":
                 self.graph.clear_all()
                 self.scan_local_lldp()
+                self.graph.evaluate_reachability_and_purge(probe_mtls_reachability)
                 resp = {"status": "ok", "message": "All devices cleared and re-scanned"}
             else:
                 resp = {"status": "error", "message": f"Unknown action {action}"}
