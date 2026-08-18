@@ -15,7 +15,12 @@
    ./build-deb.sh
    ```
 
-2. **Deploy & install on switches:**
+2. **Generate CA Cert for lab:**
+   ```bash
+   containerlab tools cert ca create -p lab/tls
+   ```
+
+3. **Deploy lab & install srlx on switches:**
    ```bash
    # Deploy test lab with Containerlab (includes mTLS CA)
    containerlab deploy -t lab/srlx-test.clab.yaml
@@ -27,10 +32,10 @@
    done
    ```
 
-3. **Run multi-node commands (`sr_cli`):**
+4. **Run multi-node commands on lab devices:**
    ```text
    A:root@srl1# srlx show version
-   A:root@srl1# srlx srl3 srl5 info interface ethernet-1/1 | as json
+   A:root@srl1# srlx srl3 srl5 info interface ethernet-1/1
    ```
 
 ---
