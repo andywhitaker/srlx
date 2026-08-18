@@ -702,11 +702,9 @@ def run_srlx_execution(output, target_devices, cmd):
                 ip_list = info.get("mgmt_addrs", [])
                 target_ip = ip_list[0] if ip_list else dev_name
                 netns = info.get("netns", "mgmt")
-                port = info.get("local_port", "")
                 output_text = str(results[dev_name])
-
                 banner = f"\n======================================================================\n" \
-                         f" Device: {dev_name} (IP: {target_ip} | VRF/NetNS: {netns} | Port: {port})\n" \
+                         f" Device: {dev_name} (IP: {target_ip} | VRF/NetNS: {netns})\n" \
                          f" Command: {cmd}\n" \
                          f"======================================================================\n"
                 output.print(banner)
@@ -950,8 +948,7 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
             "mtls_security_state": {
                 "verified": is_mtls_verified,
                 "ca_certificate": ca_desc,
-                "tls_profile": profile_desc,
-                "protocol": "TLSv1.3" if is_mtls_verified else "None"
+                "tls_profile": profile_desc
             }
         }
         output.print_line(json.dumps(detail_dict, indent=2))
@@ -968,15 +965,14 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
             "mtls_security_state": {
                 "verified": is_mtls_verified,
                 "ca_certificate": ca_desc,
-                "tls_profile": profile_desc,
-                "protocol": "TLSv1.3" if is_mtls_verified else "None"
+                "tls_profile": profile_desc
             }
         }
         output.print_line("---")
         output.print_line(dump_simple_yaml({"device_detail": detail_dict}))
         return
 
-    sec_status_str = f"Verified (CA: {ca_desc}, Profile: {profile_desc}, TLSv1.3)" if is_mtls_verified else f"Failed / Unreachable (CA: {ca_desc}, Profile: {profile_desc})"
+    sec_status_str = f"Verified (CA: {ca_desc}, Profile: {profile_desc})" if is_mtls_verified else f"Failed / Unreachable (CA: {ca_desc}, Profile: {profile_desc})"
 
     output.print_line("\n======================================================================")
     output.print_line(f" Device Detail: {target_name}")
