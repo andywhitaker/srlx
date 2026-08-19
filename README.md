@@ -1,4 +1,4 @@
-# SRLX — SR Linux Multi-Node Command Executor & Topology Mesh
+# SRLX — SR Linux Multi-Node Command Executor With Topology Discovery
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
