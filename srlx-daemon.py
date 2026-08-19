@@ -307,6 +307,49 @@ def create_tls_client_context():
         return None
 
 
+def check_peer_reachable(host, port=None, netns="mgmt", timeout=1.0):
+    """
+    Checks whether a peer switch is reachable over mTLS gossip port or HTTPS JSON-RPC in-process.
+    Returns True if reachable, False otherwise.
+    """
+    if not host or host == "Unknown":
+        return False
+    g_port = port or get_gossip_port()
+    tls_ctx = create_tls_client_context()
+    if not tls_ctx:
+        return False
+
+    candidates = []
+    for cand in ["mgmt", "srbase-mgmt", "management", netns, "default", "srbase"]:
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    for c_netns in candidates:
+        switch_netns(c_netns)
+        for p in [g_port, 443]:
+            s = None
+            tls_s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                tls_s = tls_ctx.wrap_socket(s, server_side=False)
+                tls_s.connect((host, p))
+                tls_s.close()
+                return True
+            except Exception:
+                if tls_s:
+                    try:
+                        tls_s.close()
+                    except Exception:
+                        pass
+                elif s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+    return False
+
+
 def query_local_state_once(path, netns="mgmt"):
     """
     Performs a one-time local datastore state read strictly in-process using JSON-RPC method 'get' (never 'cli').
@@ -638,7 +681,7 @@ class TopologyGraph:
             }
             self.validated_nodes.add(self.local_hostname)
 
-    def update_single_direct_lldp(self, sys_name, resolved_ip, local_port, netns="mgmt"):
+    def update_single_direct_lldp(self, sys_name, resolved_ip, local_port, netns="mgmt", status="Direct mTLS OK"):
         if not sys_name or sys_name == self.local_hostname:
             return False
         now = time.time()
@@ -648,7 +691,7 @@ class TopologyGraph:
                 self.nodes[sys_name] = {
                     "mgmt_addrs": clean_addrs,
                     "netns": netns,
-                    "status": "Direct mTLS OK",
+                    "status": status,
                     "learned_via": "Direct",
                     "last_updated": now,
                     "is_direct_lldp": True,
@@ -661,17 +704,37 @@ class TopologyGraph:
             else:
                 prev_addrs = self.nodes[sys_name].get("mgmt_addrs", [])
                 was_direct = self.nodes[sys_name].get("is_direct_lldp", False)
+                prev_status = self.nodes[sys_name].get("status")
                 self.nodes[sys_name]["mgmt_addrs"] = clean_addrs
                 self.nodes[sys_name]["is_direct_lldp"] = True
                 self.nodes[sys_name]["port"] = local_port
                 self.nodes[sys_name]["netns"] = netns
                 self.nodes[sys_name]["last_updated"] = now
-                self.nodes[sys_name]["status"] = "Direct mTLS OK"
+                self.nodes[sys_name]["status"] = status
                 self.nodes[sys_name]["learned_via"] = "Direct"
                 self.nodes[sys_name].setdefault("direct_neighbors", set()).add(self.local_hostname)
                 self.nodes[self.local_hostname]["direct_neighbors"].add(sys_name)
                 self.validated_nodes.add(sys_name)
-                return (not was_direct) or (prev_addrs != clean_addrs)
+                return (not was_direct) or (prev_addrs != clean_addrs) or (prev_status != status)
+
+    def mark_direct_neighbor_failed(self, sys_name):
+        """
+        Marks a direct neighbor as failed when LLDP is lost and reachability check fails.
+        Keeps the device in the table with Reachable status 'FAIL' and removes direct adjacency reporting.
+        """
+        if not sys_name or sys_name == self.local_hostname:
+            return False
+        now = time.time()
+        with self.lock:
+            if sys_name in self.nodes:
+                self.nodes[sys_name]["is_direct_lldp"] = False
+                self.nodes[sys_name]["status"] = "FAIL"
+                self.nodes[sys_name]["learned_via"] = "Direct (Down)"
+                self.nodes[sys_name].setdefault("direct_neighbors", set()).discard(self.local_hostname)
+                self.nodes[self.local_hostname]["direct_neighbors"].discard(sys_name)
+                self.nodes[sys_name]["last_updated"] = now
+                return True
+            return False
 
     def remove_direct_lldp(self, sys_name):
         """
@@ -691,15 +754,15 @@ class TopologyGraph:
                     self.nodes[sys_name]["status"] = "Mesh Reachable"
                     self.nodes[sys_name]["learned_via"] = "Mesh"
                 else:
-                    self.nodes[sys_name]["status"] = "Unreachable"
+                    self.nodes[sys_name]["status"] = "FAIL"
                     self.nodes[sys_name]["learned_via"] = "Direct (Down)"
                 return True
             return False
 
-    def merge_peer_vector(self, peer_name, peer_nodes):
+    def merge_peer_vector(self, peer_name, peer_nodes, ndk_client=None):
         """
         Merges a topology vector pushed in real-time by a direct peer over mTLS.
-        peer_nodes can be a dict of nodes or list of node objects.
+        If a remote node is no longer reported by any peer and is unreachable, prunes it.
         """
         now = time.time()
         has_changes = False
@@ -713,10 +776,12 @@ class TopologyGraph:
             elif isinstance(peer_nodes, list):
                 items = peer_nodes
 
+            received_node_names = set()
             for item in items:
                 dev_name = item.get("name")
                 if not dev_name:
                     continue
+                received_node_names.add(dev_name)
 
                 raw_mgmt = item.get("mgmt_addrs") or [item.get("mgmt-address")]
                 mgmt_ip = resolve_neighbor_ip(raw_mgmt, dev_name)
@@ -729,13 +794,13 @@ class TopologyGraph:
                     self.nodes[dev_name] = {
                         "mgmt_addrs": [mgmt_ip],
                         "netns": netns,
-                        "status": "mTLS OK" if r_status != "Unreachable" else "Unreachable",
+                        "status": "FAIL" if r_status == "FAIL" else ("Unreachable" if (r_status == "Unreachable" or (not r_direct and r_status != "Local")) else "mTLS OK"),
                         "learned_via": "Mesh",
                         "last_updated": now,
                         "is_direct_lldp": False,
                         "direct_neighbors": set()
                     }
-                    if r_status != "Unreachable":
+                    if r_status not in ("Unreachable", "FAIL"):
                         self.validated_nodes.add(dev_name)
                 else:
                     if mgmt_ip and is_valid_ip(mgmt_ip) and self.nodes[dev_name]["mgmt_addrs"] != [mgmt_ip]:
@@ -743,6 +808,14 @@ class TopologyGraph:
                         has_changes = True
 
                 cur_d = self.nodes[dev_name].setdefault("direct_neighbors", set())
+                # Update peer direct report status
+                if peer_name in r_direct and peer_name not in cur_d:
+                    cur_d.add(peer_name)
+                    has_changes = True
+                elif peer_name not in r_direct and peer_name in cur_d:
+                    cur_d.discard(peer_name)
+                    has_changes = True
+
                 for neighbor in r_direct:
                     if neighbor not in cur_d:
                         cur_d.add(neighbor)
@@ -767,17 +840,51 @@ class TopologyGraph:
                 if dev_name == self.local_hostname:
                     self.nodes[dev_name]["learned_via"] = "Local"
                     self.nodes[dev_name]["status"] = "Local"
-                elif self.nodes[dev_name].get("is_direct_lldp"):
+                elif self.nodes[dev_name].get("is_direct_lldp") or dev_name == peer_name:
                     self.nodes[dev_name]["learned_via"] = "Direct"
                     self.nodes[dev_name]["status"] = "Direct mTLS OK"
+                    self.nodes[dev_name]["is_direct_lldp"] = True
+                    self.nodes[dev_name].setdefault("direct_neighbors", set()).add(self.local_hostname)
+                    self.nodes[self.local_hostname]["direct_neighbors"].add(dev_name)
+                    self.validated_nodes.add(dev_name)
                 else:
                     self.nodes[dev_name]["learned_via"] = "Mesh"
-                    if not self.nodes[dev_name].get("direct_neighbors") and r_status == "Unreachable":
+                    if r_status == "FAIL":
+                        self.nodes[dev_name]["status"] = "FAIL"
+                    elif not self.nodes[dev_name].get("direct_neighbors") and r_status == "Unreachable":
                         self.nodes[dev_name]["status"] = "Unreachable"
                     else:
-                        self.nodes[dev_name]["status"] = "mTLS OK" if r_status != "Unreachable" else "Unreachable"
+                        self.nodes[dev_name]["status"] = "mTLS OK" if r_status not in ("Unreachable", "FAIL") else r_status
 
                 self.nodes[dev_name]["last_updated"] = now
+
+            # Prune check: if peer removed a node or node has no direct reporters and we are not direct to it
+            nodes_to_prune = []
+            for d_name, d_data in list(self.nodes.items()):
+                if d_name == self.local_hostname:
+                    continue
+                if d_data.get("is_direct_lldp", False):
+                    continue
+
+                d_directs = d_data.get("direct_neighbors", set())
+                if peer_name in d_directs and peer_name not in received_node_names:
+                    d_directs.discard(peer_name)
+                    has_changes = True
+
+                if not d_directs and d_data.get("status") != "FAIL":
+                    nodes_to_prune.append(d_name)
+
+            for p_node in nodes_to_prune:
+                p_addrs = self.nodes[p_node].get("mgmt_addrs", [])
+                p_ip = p_addrs[0] if p_addrs else p_node
+                p_netns = self.nodes[p_node].get("netns", self.mgmt_netns)
+                if not check_peer_reachable(p_ip, get_gossip_port(), p_netns):
+                    del self.nodes[p_node]
+                    self.validated_nodes.discard(p_node)
+                    if ndk_client:
+                        ndk_client.delete_node_state(p_node)
+                    has_changes = True
+
         return has_changes
 
     def get_direct_lldp_neighbors(self):
@@ -1015,13 +1122,30 @@ class SrlNdkClient:
                         elif hasattr(val, 'address'):
                             mgmt_addrs.append(str(val.address))
 
+                    if op_type == "DELETE" and not sys_name:
+                        neigh_info = self.daemon.known_lldp_neighbors.get(iface_name, {})
+                        sys_name = neigh_info.get("sys_name", "")
+                        if not mgmt_addrs:
+                            mgmt_addrs = neigh_info.get("mgmt_addrs", [])
+
                     self.daemon.on_ndk_lldp_event(iface_name, sys_name, sys_desc, op_type, mgmt_addrs)
 
                 # Interface State Event
                 if n.HasField('interface'):
                     inf = n.interface
-                    if inf.op == common.SDK_MGR_OPERATION_CREATE_OR_UPDATE:
-                        self.daemon.refresh_netns_mappings()
+                    iface_name = inf.key.interface_name
+                    self.daemon.refresh_netns_mappings()
+                    if iface_name in self.daemon.known_lldp_neighbors:
+                        try:
+                            intf_state = query_local_state_once(f"/interface[name={iface_name}]/oper-state", netns=self.daemon.mgmt_netns)
+                            is_down = (intf_state in ("down", ["down"])) or (isinstance(intf_state, dict) and intf_state.get("oper-state") == "down")
+                            if is_down:
+                                neigh_info = self.daemon.known_lldp_neighbors.get(iface_name, {})
+                                s_name = neigh_info.get("sys_name", "")
+                                m_addrs = neigh_info.get("mgmt_addrs", [])
+                                self.daemon.on_ndk_lldp_event(iface_name, s_name, "", "DELETE", m_addrs)
+                        except Exception:
+                            pass
 
                 # Config Sync / Acknowledgment
                 if n.HasField('config'):
@@ -1077,36 +1201,71 @@ class SRLXDaemon:
 
     def on_ndk_lldp_event(self, iface_name, sys_name, sys_desc, op_type, mgmt_addrs=None):
         """Real-time event callback fired by NDK notification stream (<1ms push)."""
-        if not sys_name or sys_name == self.local_hostname:
-            return
-
-        resolved_ip = resolve_neighbor_ip(mgmt_addrs, sys_name)
-        resolved_netns = self.get_interface_netns(iface_name)
-
         if op_type == "CREATE_OR_UPDATE":
+            if not sys_name or sys_name == self.local_hostname:
+                return
+
+            resolved_ip = resolve_neighbor_ip(mgmt_addrs, sys_name)
+            resolved_netns = self.get_interface_netns(iface_name)
+
+            # Validate connectivity
+            is_reachable = check_peer_reachable(resolved_ip, get_gossip_port(), resolved_netns)
             self.known_lldp_neighbors[iface_name] = {
                 "sys_name": sys_name,
                 "sys_desc": sys_desc,
                 "mgmt_addrs": mgmt_addrs or []
             }
-            changed = self.graph.update_single_direct_lldp(sys_name, resolved_ip, iface_name, netns=resolved_netns)
+            status = "Direct mTLS OK" if is_reachable else "FAIL"
+            changed = self.graph.update_single_direct_lldp(sys_name, resolved_ip, iface_name, netns=resolved_netns, status=status)
+
+            # Publish live state to NDK telemetry datastore
+            self.ndk_client.publish_topology_state(self.graph.export_vector())
+
+            # Pure Event-Driven Push: Cascade topology changes to direct LLDP neighbors over mTLS
+            if changed:
+                self.push_vector_to_direct_neighbors(except_peer=None)
+
         else:
-            self.known_lldp_neighbors.pop(iface_name, None)
-            changed = self.graph.remove_direct_lldp(sys_name)
+            # DELETE event
+            cached_info = self.known_lldp_neighbors.pop(iface_name, None)
+            if not sys_name and cached_info:
+                sys_name = cached_info.get("sys_name")
+                mgmt_addrs = cached_info.get("mgmt_addrs", [])
 
-        # Publish live state to NDK telemetry datastore
-        self.ndk_client.publish_topology_state(self.graph.export_vector())
+            if not sys_name or sys_name == self.local_hostname:
+                return
 
-        # Pure Event-Driven Push: Cascade topology changes to direct LLDP neighbors over mTLS
-        if changed:
-            self.push_vector_to_direct_neighbors(except_peer=None)
+            # Check if there are other active direct links to sys_name
+            other_link = False
+            for o_iface, o_info in self.known_lldp_neighbors.items():
+                if o_info.get("sys_name") == sys_name:
+                    other_link = True
+                    break
+
+            if other_link:
+                changed = False
+            else:
+                resolved_ip = resolve_neighbor_ip(mgmt_addrs, sys_name)
+                resolved_netns = self.get_interface_netns(iface_name)
+                is_reachable = check_peer_reachable(resolved_ip, get_gossip_port(), resolved_netns)
+                if is_reachable:
+                    changed = self.graph.remove_direct_lldp(sys_name)
+                else:
+                    changed = self.graph.mark_direct_neighbor_failed(sys_name)
+
+            # Publish live state to NDK telemetry datastore
+            self.ndk_client.publish_topology_state(self.graph.export_vector())
+
+            if changed:
+                self.push_vector_to_direct_neighbors(except_peer=sys_name)
 
     def reseed_and_sync_neighbors(self):
         """
-        Grabs all currently active LLDP neighbors (from state datastore & cache),
+        Grabs all currently active LLDP neighbors (from state datastore),
         re-populates the direct neighbors in the local graph, and triggers a full gossip push cascade.
         """
-        # 1. Query state datastore to capture all current LLDP neighbors
+        # 1. Rebuild known LLDP neighbors from scratch using active datastore state
+        active_neighbors = {}
         try:
             raw_lldp = query_local_state_once("/system/lldp/interface", netns=self.mgmt_netns)
             if raw_lldp and isinstance(raw_lldp, dict):
@@ -1118,7 +1277,7 @@ class SRLXDaemon:
                         s_desc = neigh.get("system-description", "")
                         m_addrs = [m.get("address") for m in neigh.get("management-address", []) if m.get("address")]
                         if s_name and s_name != self.local_hostname:
-                            self.known_lldp_neighbors[iface_name] = {
+                            active_neighbors[iface_name] = {
                                 "sys_name": s_name,
                                 "sys_desc": s_desc,
                                 "mgmt_addrs": m_addrs
@@ -1126,7 +1285,9 @@ class SRLXDaemon:
         except Exception:
             pass
 
-        # 2. Re-populate all direct neighbors in graph
+        self.known_lldp_neighbors = active_neighbors
+
+        # 2. Re-populate all verified active direct neighbors in graph
         for iface_name, n_info in list(self.known_lldp_neighbors.items()):
             sys_name = n_info.get("sys_name")
             mgmt_addrs = n_info.get("mgmt_addrs", [])
@@ -1134,7 +1295,8 @@ class SRLXDaemon:
                 continue
             resolved_ip = resolve_neighbor_ip(mgmt_addrs, sys_name)
             resolved_netns = self.get_interface_netns(iface_name)
-            self.graph.update_single_direct_lldp(sys_name, resolved_ip, iface_name, netns=resolved_netns)
+            if check_peer_reachable(resolved_ip, get_gossip_port(), resolved_netns):
+                self.graph.update_single_direct_lldp(sys_name, resolved_ip, iface_name, netns=resolved_netns)
 
         # 3. Publish to NDK datastore
         self.ndk_client.publish_topology_state(self.graph.export_vector())
@@ -1224,7 +1386,7 @@ class SRLXDaemon:
         if not peer_nodes or sender == self.local_hostname:
             return
 
-        changed = self.graph.merge_peer_vector(sender, peer_nodes)
+        changed = self.graph.merge_peer_vector(sender, peer_nodes, ndk_client=self.ndk_client)
         if changed:
             # Publish updated state to native SR Linux NDK datastore (/srlx/node)
             self.ndk_client.publish_topology_state(self.graph.export_vector())

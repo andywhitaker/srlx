@@ -164,7 +164,8 @@ if existing_cpm:
                 pass
 ' || true
 
-# Reload app_mgr so SR Linux immediately starts the srlx daemon under app_mgr supervision
+# Reload app_mgr and restart srlx daemon under app_mgr supervision
 if [ -x /opt/srlinux/bin/sr_cli ]; then
     /opt/srlinux/bin/sr_cli "tools system app-management application app_mgr reload" || true
+    /opt/srlinux/bin/sr_cli "tools system app-management application srlx restart" || true
 fi

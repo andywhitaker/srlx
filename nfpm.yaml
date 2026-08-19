@@ -1,7 +1,7 @@
 name: "srlx"
 arch: "all"
 platform: "linux"
-version: "0.0.4"
+version: "0.0.5"
 section: "default"
 priority: "optional"
 maintainer: "Andy Whitaker <andy.whitaker@nokia.com>"

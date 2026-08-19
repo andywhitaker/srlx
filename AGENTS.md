@@ -43,13 +43,13 @@ Guidelines, invariants, and constraints for developing and maintaining the SRLX 
 ---
 
 ## 6. Build & Test Workflow
-- **Package Build**: `./build-deb.sh` (produces `srlx_0.0.4.deb`).
+- **Package Build**: `./build-deb.sh` (produces `srlx_0.0.5.deb`).
 - **Lab Deployment**: `clab deploy -c -t lab/srlx-test.clab.yaml` (run directly without sudo).
 - **Package Installation**: Install across test nodes using:
   ```bash
   for node in srl1 srl2 srl3 srl4 srl5; do
-    docker cp srlx_0.0.4.deb $node:/tmp/
-    docker exec $node dpkg -i /tmp/srlx_0.0.4.deb
+    docker cp srlx_0.0.5.deb $node:/tmp/
+    docker exec $node dpkg -i /tmp/srlx_0.0.5.deb
   done
   ```
 - **Verification**: Verify topology and reporters with `sr_cli "show srlx devices"` and test multi-node execution with `sr_cli "srlx show version"`.

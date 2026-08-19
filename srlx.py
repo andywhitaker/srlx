@@ -953,7 +953,14 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
             mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != d]
             learned_via = data.get("learned_via") or ("Local" if d == local_name else ("Direct" if local_name in direct_reporters else "Mesh"))
             raw_status = data.get("status", "")
-            reachable = "Local" if d == local_name else ("Unreachable" if ("Unreachable" in raw_status or "Failed" in raw_status) else "mTLS OK")
+            if d == local_name:
+                reachable = "Local"
+            elif raw_status == "FAIL" or "Fail" in raw_status:
+                reachable = "FAIL"
+            elif "Unreachable" in raw_status:
+                reachable = "Unreachable"
+            else:
+                reachable = "mTLS OK"
             last_ts = data.get("last_updated", now)
             elapsed = int(now - last_ts)
             last_seen = "Local" if d == local_name else (f"{elapsed}s ago" if elapsed > 0 else "Instant")
@@ -976,7 +983,14 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
             mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != d]
             learned_via = data.get("learned_via") or ("Local" if d == local_name else ("Direct" if local_name in direct_reporters else "Mesh"))
             raw_status = data.get("status", "")
-            reachable = "Local" if d == local_name else ("Unreachable" if ("Unreachable" in raw_status or "Failed" in raw_status) else "mTLS OK")
+            if d == local_name:
+                reachable = "Local"
+            elif raw_status == "FAIL" or "Fail" in raw_status:
+                reachable = "FAIL"
+            elif "Unreachable" in raw_status:
+                reachable = "Unreachable"
+            else:
+                reachable = "mTLS OK"
             last_ts = data.get("last_updated", now)
             elapsed = int(now - last_ts)
             last_seen = "Local" if d == local_name else (f"{elapsed}s ago" if elapsed > 0 else "Instant")
@@ -1014,7 +1028,9 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
         raw_status = data.get("status", "")
         if d == local_name:
             reachable = "Local"
-        elif "Unreachable" in raw_status or "Failed" in raw_status:
+        elif raw_status == "FAIL" or "Fail" in raw_status:
+            reachable = "FAIL"
+        elif "Unreachable" in raw_status:
             reachable = "Unreachable"
         else:
             reachable = "mTLS OK"
@@ -1084,7 +1100,9 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
     raw_status = data.get("status", "")
     if target_name == local_name:
         reachable = "Local"
-    elif "Unreachable" in raw_status or "Failed" in raw_status:
+    elif raw_status == "FAIL" or "Fail" in raw_status:
+        reachable = "FAIL"
+    elif "Unreachable" in raw_status:
         reachable = "Unreachable"
     else:
         reachable = "mTLS OK"
@@ -1093,7 +1111,7 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
     ca_desc = os.path.basename(tls_info['ca_cert']) if tls_info.get('ca_cert') else "None"
     profile_desc = tls_info.get('profile_name', 'System')
 
-    is_mtls_verified = (reachable != "Unreachable")
+    is_mtls_verified = (reachable == "mTLS OK" or reachable == "Local")
 
     if requested_fmt == "json":
         detail_dict = {
