@@ -1,7 +1,15 @@
 srlx:
   path: /opt/srlx/bin
   launch-command: ./srlx-daemon.py
-  search-command: srlx-daemon
-  version: 0.0.3
-  failure-threshold: 3
-  yang-files: [/opt/srlx/models/srlx.yang]
+  search-command: ./srlx-daemon.py
+  author: "Nokia"
+  run-as-user: root
+  failure-action: "wait=60"
+  config-delivery-format: binary-tlvs
+  yang-modules:
+    names:
+      - "srlx"
+    source-directories:
+      - "/etc/opt/srlinux/models"
+      - "/opt/srlx/models"
+      - "/opt/srlinux/models/srl_nokia/models"

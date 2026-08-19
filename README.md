@@ -27,8 +27,8 @@
 
    # Install SRLX package on all nodes
    for node in srl1 srl2 srl3 srl4 srl5; do
-     docker cp srlx_0.0.3.deb $node:/tmp/
-     docker exec $node dpkg -i /tmp/srlx_0.0.3.deb
+     docker cp srlx_0.0.4.deb $node:/tmp/
+     docker exec $node dpkg -i /tmp/srlx_0.0.4.deb
    done
    ```
 

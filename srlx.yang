@@ -44,6 +44,16 @@ module srlx {
                 description "List of switch hostnames reporting direct LLDP adjacency";
             }
 
+            leaf-list mesh-reporters {
+                type string;
+                description "List of switch hostnames reporting mesh adjacency";
+            }
+
+            leaf learned-via {
+                type string;
+                description "Learned via method (Local, Direct, Mesh)";
+            }
+
             leaf last-updated {
                 type string;
                 description "Timestamp of last state update";

@@ -1,13 +1,25 @@
+import base64
+import ctypes
+import ipaddress
 import json
 import os
 import re
 import socket
-import subprocess
+import ssl
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from srlinux.mgmt.cli.cli_plugin import CliPlugin
 from srlinux.mgmt.cli.tools_plugin import ToolsPlugin
 from srlinux.syntax import Syntax
+
+try:
+    from srlinux.schema.data_store import DataStore
+    from srlinux.location import build_path
+    DATASTORE_AVAILABLE = True
+except Exception:
+    DATASTORE_AVAILABLE = False
 
 try:
     from srlinux.mgmt.cli.output_format import OutputFormat, OUTPUT_FORMAT_MODIFIABLE_COMMANDS
@@ -20,6 +32,7 @@ except Exception:
         yaml = "yaml"
         table = "table"
         xml = "xml"
+
 
 def get_requested_output_format(output):
     if hasattr(output, "output_format"):
@@ -34,6 +47,7 @@ def get_requested_output_format(output):
         elif "xml" in fmt_name:
             return "xml"
     return "text"
+
 
 def dump_simple_yaml(obj, indent_level=0):
     indent = "  " * indent_level
@@ -58,26 +72,80 @@ def dump_simple_yaml(obj, indent_level=0):
     else:
         return f"{indent}{obj}"
 
-# Global persistent cache across CLI plugin instances (60s TTL fallback)
-_DISCOVERY_CACHE = {"timestamp": 0, "devices": {}}
-DAEMON_SOCKET_PATH = "/var/run/srlx-daemon.sock"
+
+DAEMON_SOCKET_PATH = "/tmp/srlx-daemon.sock"
+CLONE_NEWNET = 0x40000000
+
+try:
+    _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+    _SETNS = _LIBC.setns
+    _SETNS.argtypes = [ctypes.c_int, ctypes.c_int]
+    _SETNS.restype = ctypes.c_int
+except Exception:
+    _LIBC = None
+    _SETNS = None
+
+_CACHED_LOCAL_HOSTNAME = None
+
+
+def switch_netns(netns_name="mgmt"):
+    """
+    Switches the network namespace of the calling thread using glibc setns.
+    Operates strictly in-process with zero subprocess execution.
+    """
+    if not _SETNS:
+        return False
+    candidates = []
+    if not netns_name or netns_name in ("default", "srbase", "srbase-default"):
+        candidates = ["srbase", "default", "srbase-default"]
+    elif netns_name.startswith("srbase-"):
+        candidates = [netns_name, netns_name[7:]]
+    else:
+        candidates = [f"srbase-{netns_name}", netns_name]
+
+    try:
+        for base_dir in ["/var/run/netns", "/run/netns"]:
+            for cand in candidates:
+                cand_path = os.path.join(base_dir, cand)
+                if os.path.exists(cand_path):
+                    with open(cand_path, "r") as f:
+                        return _SETNS(f.fileno(), CLONE_NEWNET) == 0
+    except Exception:
+        pass
+    return False
+
+
+def is_valid_ip(addr_str):
+    """Validates whether a string is a valid IPv4 or IPv6 address (excluding loopback/unspecified)."""
+    if not addr_str:
+        return False
+    try:
+        clean = addr_str.split("/")[0].strip()
+        ip = ipaddress.ip_address(clean)
+        return not (ip.is_loopback or ip.is_unspecified)
+    except ValueError:
+        return False
+
 
 def natural_sort_key(name):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", name)]
 
+
 def query_daemon_socket(payload):
+    """Queries local SRLX background daemon via UNIX domain socket."""
     if not os.path.exists(DAEMON_SOCKET_PATH):
         return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.0)
+        s.settimeout(5.0)
         s.connect(DAEMON_SOCKET_PATH)
         s.sendall(json.dumps(payload).encode() + b"\n")
-        raw = s.recv(16384).decode().strip()
+        raw = s.recv(65536).decode().strip()
         s.close()
         return json.loads(raw)
     except Exception:
         return None
+
 
 def parse_target_and_cmd_tokens(raw_tokens, known_devices=None):
     if known_devices is None:
@@ -93,13 +161,23 @@ def parse_target_and_cmd_tokens(raw_tokens, known_devices=None):
             cmd_tokens.append(t)
     return dev_tokens, cmd_tokens
 
-def get_auth_curl_flags():
-    netrc_path = os.path.expanduser("~/.netrc")
-    if os.path.exists(netrc_path):
-        return ["--netrc-file", netrc_path]
 
+def get_auth_credentials():
     user = os.environ.get("SRLX_USER")
     password = os.environ.get("SRLX_PASS", os.environ.get("SRLX_PASSWORD"))
+
+    if not user or not password:
+        netrc_path = os.path.expanduser("~/.netrc")
+        if os.path.exists(netrc_path):
+            try:
+                import netrc
+                n = netrc.netrc(netrc_path)
+                auth = n.authenticators("default") or next(iter(n.hosts.values()), None)
+                if auth:
+                    user = user or auth[0]
+                    password = password or auth[2]
+            except Exception:
+                pass
 
     if not user or not password:
         config_path = os.path.expanduser("~/.srlx.json")
@@ -114,7 +192,17 @@ def get_auth_curl_flags():
 
     user = user or "admin"
     password = password or "NokiaSrl1!"
-    return ["-u", f"{user}:{password}"]
+    return user, password
+
+
+def get_auth_headers():
+    user, password = get_auth_credentials()
+    b64 = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("utf-8")
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {b64}"
+    }
+
 
 def resolve_tls_certificates():
     config_data = {}
@@ -128,7 +216,11 @@ def resolve_tls_certificates():
 
     ca_path = os.environ.get("SRLX_CA_CERT") or config_data.get("ca_cert") or config_data.get("ca_file")
     if not ca_path or not os.path.exists(ca_path):
-        for candidate in ["/etc/opt/srlinux/tls/ca.pem"]:
+        for candidate in [
+            "/etc/opt/srlinux/tls/ca.pem",
+            "/etc/opt/srlinux/tls/ca/ca.pem",
+            "/etc/opt/srlinux/tls/clab-profile.ca.pem"
+        ]:
             if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
                 ca_path = candidate
                 break
@@ -138,25 +230,33 @@ def resolve_tls_certificates():
     profile_name = "Custom" if client_cert else None
 
     if not (client_cert and client_key and os.path.exists(client_cert) and os.path.exists(client_key)):
-        for prof in ["clab-profile", "__default__"]:
-            c_cand = f"/etc/opt/srlinux/tls/{prof}.pem"
-            k_cand = f"/etc/opt/srlinux/tls/{prof}.key.pem"
-            if os.path.exists(c_cand) and os.path.exists(k_cand):
-                client_cert, client_key, profile_name = c_cand, k_cand, prof
-                break
+        tls_dir = "/etc/opt/srlinux/tls"
+        if os.path.exists(tls_dir):
+            for prof in ["clab-profile", "__default__", "default-server-profile"]:
+                c_cand = os.path.join(tls_dir, f"{prof}.pem")
+                for k_ext in [".key.pem", ".key"]:
+                    k_cand = os.path.join(tls_dir, f"{prof}{k_ext}")
+                    if os.path.exists(c_cand) and os.path.exists(k_cand):
+                        client_cert, client_key, profile_name = c_cand, k_cand, prof
+                        break
+                if client_cert:
+                    break
 
-        if not client_cert and os.path.exists("/etc/opt/srlinux/tls"):
-            try:
-                for fname in os.listdir("/etc/opt/srlinux/tls"):
-                    if fname.endswith(".pem") and not fname.endswith(".key.pem") and not fname.endswith(".ca.pem") and fname != "ca.pem":
-                        base = fname[:-4]
-                        k_cand = os.path.join("/etc/opt/srlinux/tls", f"{base}.key.pem")
-                        c_cand = os.path.join("/etc/opt/srlinux/tls", fname)
-                        if os.path.exists(k_cand):
-                            client_cert, client_key, profile_name = c_cand, k_cand, base
-                            break
-            except Exception:
-                pass
+            if not client_cert:
+                try:
+                    for fname in sorted(os.listdir(tls_dir)):
+                        if fname.endswith(".pem") and not fname.endswith(".key.pem") and not fname.endswith(".ca.pem") and fname != "ca.pem":
+                            base = fname[:-4]
+                            for k_ext in [".key.pem", ".key"]:
+                                k_cand = os.path.join(tls_dir, f"{base}{k_ext}")
+                                c_cand = os.path.join(tls_dir, fname)
+                                if os.path.exists(k_cand) and os.path.exists(c_cand):
+                                    client_cert, client_key, profile_name = c_cand, k_cand, base
+                                    break
+                            if client_cert:
+                                break
+                except Exception:
+                    pass
 
     return {
         "ca_cert": ca_path if (ca_path and os.path.exists(ca_path)) else None,
@@ -165,54 +265,185 @@ def resolve_tls_certificates():
         "profile_name": profile_name or "System"
     }
 
-def get_multi_jsonrpc_netns(paths, datastore="state", netns="mgmt"):
-    target_netns = f"srbase-{netns}" if netns != "default" else "srbase"
-    cmds = [{"path": p, "datastore": datastore} for p in paths]
-    auth_flags = get_auth_curl_flags()
 
-    cmd_args = [
-        "sudo", "-n", "ip", "netns", "exec", target_netns,
-        "curl", "-s"
-    ]
-    cmd_args.extend(auth_flags)
-    cmd_args.extend([
-        "-X", "POST", "http://127.0.0.1:80/jsonrpc",
-        "-H", "Content-Type: application/json",
-        "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "get", "params": {"commands": cmds}})
-    ])
+def query_local_state_once(paths, datastore="state", netns="mgmt"):
+    """
+    Executes a one-time in-process JSON-RPC query against local switch using method 'get' (never 'cli').
+    Used only as a fallback if the daemon socket is unavailable.
+    """
+    switch_netns(netns)
+    cmds = [{"path": p, "datastore": datastore} for p in paths]
+    auth_headers = get_auth_headers()
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "get",
+        "params": {"commands": cmds}
+    }).encode("utf-8")
+
+    # 1. Local HTTP port 80 (in mgmt netns)
     try:
-        res = subprocess.check_output(cmd_args, stderr=subprocess.DEVNULL)
-        data = json.loads(res.decode())
-        if "result" in data:
-            return data["result"]
+        req = urllib.request.Request("http://127.0.0.1:80/jsonrpc", data=body, headers=auth_headers)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "result" in data:
+                return data["result"]
     except Exception:
         pass
 
-    # Fallback to local HTTPS port 443 with -k (safe on loopback)
-    cmd_args_ssl = [
-        "sudo", "-n", "ip", "netns", "exec", target_netns,
-        "curl", "-k", "-s"
-    ] + auth_flags + [
-        "-X", "POST", "https://127.0.0.1:443/jsonrpc",
-        "-H", "Content-Type: application/json",
-        "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "get", "params": {"commands": cmds}})
-    ]
+    # 2. Local HTTPS port 443 (in mgmt netns)
     try:
-        res = subprocess.check_output(cmd_args_ssl, stderr=subprocess.DEVNULL)
-        return json.loads(res.decode()).get("result", [])
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req_ssl = urllib.request.Request("https://127.0.0.1:443/jsonrpc", data=body, headers=auth_headers)
+        with urllib.request.urlopen(req_ssl, context=ctx, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "result" in data:
+                return data["result"]
     except Exception:
-        return []
+        pass
+
+    return []
+
+
+def discover_network_topology_context(mgmt_netns_hint=None):
+    """
+    Dynamically discovers active network instances, the management network instance (where mgmt0 resides),
+    and maps all interfaces/subinterfaces to their corresponding network instances.
+    """
+    mgmt_netns = mgmt_netns_hint or "mgmt"
+    iface_to_netns = {}
+    all_netns = set()
+
+    res = None
+    for cand in [mgmt_netns, "mgmt", "default", "srbase-mgmt", "srbase"]:
+        try:
+            raw_res = query_local_state_once(["/network-instance"], netns=cand)
+            if raw_res and len(raw_res) > 0 and isinstance(raw_res[0], dict):
+                res = raw_res[0]
+                break
+        except Exception:
+            pass
+
+    found_mgmt_from_iface = None
+    if res and isinstance(res, dict):
+        netns_list = res.get("srl_nokia-network-instance:network-instance", res.get("network-instance", []))
+        if isinstance(netns_list, list):
+            for ni in netns_list:
+                ni_name = ni.get("name")
+                if not ni_name:
+                    continue
+                all_netns.add(ni_name)
+                for iface in ni.get("interface", []):
+                    if_name = iface.get("name", "")
+                    if if_name:
+                        base_name = if_name.split(".")[0]
+                        iface_to_netns[if_name] = ni_name
+                        iface_to_netns[base_name] = ni_name
+                        if base_name == "mgmt0" or if_name.startswith("mgmt0"):
+                            found_mgmt_from_iface = ni_name
+
+    for base_dir in ["/var/run/netns", "/run/netns"]:
+        if os.path.exists(base_dir):
+            try:
+                for entry in os.listdir(base_dir):
+                    if entry.startswith("srbase-"):
+                        all_netns.add(entry[7:])
+                    elif entry == "srbase":
+                        all_netns.add("default")
+                    elif not entry.startswith("."):
+                        all_netns.add(entry)
+            except Exception:
+                pass
+
+    if found_mgmt_from_iface:
+        mgmt_netns = found_mgmt_from_iface
+    elif "mgmt" in all_netns:
+        mgmt_netns = "mgmt"
+    elif "management" in all_netns:
+        mgmt_netns = "management"
+    elif "default" in all_netns:
+        mgmt_netns = "default"
+    else:
+        mgmt_netns = "mgmt"
+
+    all_netns.add(mgmt_netns)
+    all_netns.add("default")
+
+    return mgmt_netns, iface_to_netns, all_netns
+
 
 def get_local_hostname():
+    global _CACHED_LOCAL_HOSTNAME
+    if _CACHED_LOCAL_HOSTNAME:
+        return _CACHED_LOCAL_HOSTNAME
+
+    resp = query_daemon_socket({"action": "get_devices"})
+    if resp and resp.get("status") == "ok":
+        origin = resp.get("vector", {}).get("origin_node")
+        if origin:
+            _CACHED_LOCAL_HOSTNAME = origin
+            return _CACHED_LOCAL_HOSTNAME
+
     try:
-        results = get_multi_jsonrpc_netns(["/system/name"])
+        results = query_local_state_once(["/system/name"])
         if results and isinstance(results[0], dict) and "host-name" in results[0]:
-            return results[0]["host-name"]
+            _CACHED_LOCAL_HOSTNAME = results[0]["host-name"]
+            return _CACHED_LOCAL_HOSTNAME
     except Exception:
         pass
-    return socket.gethostname()
 
-def discover_srlinux_neighbors():
+    _CACHED_LOCAL_HOSTNAME = socket.gethostname()
+    return _CACHED_LOCAL_HOSTNAME
+
+
+def resolve_neighbor_ip(mgmt_addrs=None, name=None):
+    if mgmt_addrs:
+        for addr in mgmt_addrs:
+            if not addr:
+                continue
+            addr_str = str(addr).strip()
+            clean_ip = addr_str.split("/")[0]
+            if is_valid_ip(clean_ip):
+                return clean_ip
+
+    if name:
+        name_str = str(name).strip()
+        if is_valid_ip(name_str):
+            return name_str
+        try:
+            with open("/etc/hosts", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        ip = parts[0]
+                        if is_valid_ip(ip) and name_str in parts[1:]:
+                            return ip
+        except Exception:
+            pass
+
+        try:
+            resolved = socket.gethostbyname(name_str)
+            if is_valid_ip(resolved):
+                return resolved
+        except Exception:
+            pass
+
+        return name_str
+
+    return "Unknown"
+
+
+def discover_srlinux_neighbors(state=None):
+    """
+    Discovers all fabric switches:
+    Queries local daemon UNIX socket (/tmp/srlx-daemon.sock).
+    Zero shell / zero subprocess calls.
+    """
     resp = query_daemon_socket({"action": "get_devices"})
     if resp and resp.get("status") == "ok":
         vector = resp.get("vector", {})
@@ -225,14 +456,14 @@ def discover_srlinux_neighbors():
                     "mgmt_addrs": nd.get("mgmt_addrs", [name]),
                     "netns": nd.get("netns", "mgmt"),
                     "direct_reporters": nd.get("direct_reporters", []),
-                    "status": nd.get("status", "Reachable")
+                    "mesh_reporters": nd.get("mesh_reporters", []),
+                    "learned_via": nd.get("learned_via", "Mesh"),
+                    "status": nd.get("status", "mTLS OK")
                 }
             return devices
 
-    now = time.time()
-    if now - _DISCOVERY_CACHE["timestamp"] < 60 and _DISCOVERY_CACHE["devices"]:
-        return _DISCOVERY_CACHE["devices"]
-
+    # Fallback if daemon socket is temporarily unavailable
+    mgmt_netns, port_to_netns, _ = discover_network_topology_context()
     devices = {}
     local_name = get_local_hostname()
     if local_name:
@@ -242,19 +473,15 @@ def discover_srlinux_neighbors():
             "chassis_id": "local",
             "system_description": "Local SR Linux Switch",
             "mgmt_addrs": [local_name],
-            "netns": "mgmt",
+            "netns": mgmt_netns,
             "is_local": True
         }
 
     try:
-        results = get_multi_jsonrpc_netns(["/network-instance", "/system/lldp/interface"])
-        if len(results) >= 2:
-            netns_data, lldp_data = results[0], results[1]
-        else:
-            netns_data = results[0] if len(results) > 0 else {}
-            lldp_data = {}
+        results = query_local_state_once(["/network-instance", "/system/lldp/interface"], netns=mgmt_netns)
+        netns_data = results[0] if len(results) > 0 else {}
+        lldp_data = results[1] if len(results) > 1 else {}
 
-        port_to_netns = {}
         netns_list = netns_data.get("srl_nokia-network-instance:network-instance", netns_data.get("network-instance", []))
         for netns in netns_list:
             netns_name = netns.get("name")
@@ -273,13 +500,14 @@ def discover_srlinux_neighbors():
                     sys_name = neigh.get("system-name", "")
                     chassis_id = neigh.get("chassis-id", "")
                     mgmt_addrs = [m.get("address") for m in neigh.get("management-address", []) if m.get("address")]
-                    netns = port_to_netns.get(local_port, "mgmt")
+                    resolved_ip = resolve_neighbor_ip(mgmt_addrs, sys_name)
+                    netns = port_to_netns.get(local_port, mgmt_netns)
                     raw_neighbors.append({
                         "local_port": local_port,
                         "system_name": sys_name,
                         "chassis_id": chassis_id,
                         "system_description": sys_desc,
-                        "mgmt_addrs": mgmt_addrs,
+                        "mgmt_addrs": [resolved_ip],
                         "netns": netns,
                         "is_local": False
                     })
@@ -299,9 +527,8 @@ def discover_srlinux_neighbors():
     except Exception:
         pass
 
-    _DISCOVERY_CACHE["timestamp"] = now
-    _DISCOVERY_CACHE["devices"] = devices
     return devices
+
 
 def get_neighbor_choices(*args, **kwargs):
     discovered = discover_srlinux_neighbors()
@@ -322,58 +549,55 @@ def get_neighbor_choices(*args, **kwargs):
 
     return [choice for choice in all_choices if choice not in typed_set]
 
-def extract_device_argument_value(arguments, state=None):
-    if not arguments:
-        return ""
-    if hasattr(arguments, "get"):
-        try:
-            val = arguments.get("device")
-            if val:
-                return val[0] if isinstance(val, list) else str(val)
-        except Exception:
-            pass
-    curr = arguments
-    while hasattr(curr, "parent") and curr.parent:
-        curr = curr.parent
-        if hasattr(curr, "get"):
+
+def extract_unnamed_argument_value(arguments, name, state=None):
+    if arguments:
+        if hasattr(arguments, "get"):
             try:
-                val = curr.get("device")
+                val = arguments.get(name, name)
                 if val:
                     return val[0] if isinstance(val, list) else str(val)
             except Exception:
                 pass
-    if hasattr(arguments, "all_arguments"):
-        try:
-            all_args = arguments.all_arguments
-            if isinstance(all_args, dict) and "device" in all_args:
-                val = all_args["device"]
-                if hasattr(val, "value"):
-                    val = val.value
-                return val[0] if isinstance(val, list) else str(val)
-        except Exception:
-            pass
-    if hasattr(arguments, "local_arguments"):
-        try:
-            loc_args = arguments.local_arguments
-            if isinstance(loc_args, dict) and "device" in loc_args:
-                val = loc_args["device"]
-                if hasattr(val, "value"):
-                    val = val.value
-                return val[0] if isinstance(val, list) else str(val)
-        except Exception:
-            pass
-    if state and hasattr(state, "line_commands"):
-        try:
-            for cmd in state.line_commands.nodes:
-                if hasattr(cmd, "local_arguments") and "device" in cmd.local_arguments:
-                    val = cmd.local_arguments["device"]
-                    if hasattr(val, "value"):
-                        val = val.value
+            try:
+                val = arguments.get(name)
+                if val:
+                    return val[0] if isinstance(val, list) else str(val)
+            except Exception:
+                pass
+        curr = arguments
+        while hasattr(curr, "parent") and curr.parent:
+            curr = curr.parent
+            if hasattr(curr, "get"):
+                try:
+                    val = curr.get(name, name)
                     if val:
                         return val[0] if isinstance(val, list) else str(val)
+                except Exception:
+                    pass
+                try:
+                    val = curr.get(name)
+                    if val:
+                        return val[0] if isinstance(val, list) else str(val)
+                except Exception:
+                    pass
+
+    if state and hasattr(state, "line_commands"):
+        try:
+            line_str = str(state.line_commands)
+            tokens = line_str.strip().split()
+            if name in tokens:
+                idx = tokens.index(name)
+                if idx + 1 < len(tokens) and tokens[idx + 1] != "detail":
+                    return tokens[idx + 1]
+            elif "device" in tokens:
+                idx = tokens.index("device")
+                if idx + 1 < len(tokens) and tokens[idx + 1] != "detail":
+                    return tokens[idx + 1]
         except Exception:
             pass
     return ""
+
 
 def get_child_cmds(node, state):
     cmds = []
@@ -388,6 +612,7 @@ def get_child_cmds(node, state):
         except Exception:
             pass
     return cmds
+
 
 def get_dynamic_root_commands(state=None):
     root_cmds = set()
@@ -407,6 +632,7 @@ def get_dynamic_root_commands(state=None):
         root_cmds = {"show", "tools", "info", "help", "environment", "monitor"}
     return sorted(list(root_cmds), key=natural_sort_key)
 
+
 def get_srlx_unified_suggestions(*args, **kwargs):
     try:
         state = args[1] if len(args) >= 2 else None
@@ -421,7 +647,7 @@ def get_srlx_unified_suggestions(*args, **kwargs):
                 if raw_line.endswith(" ") and not line_str.endswith(" "):
                     line_str += " "
 
-        discovered = discover_srlinux_neighbors()
+        discovered = discover_srlinux_neighbors(state)
         known_neighbors = set(discovered.keys())
         remaining_neighbors = sorted(list(known_neighbors), key=natural_sort_key)
         dynamic_root_commands = get_dynamic_root_commands(state)
@@ -487,144 +713,111 @@ def get_srlx_unified_suggestions(*args, **kwargs):
     except Exception:
         return get_dynamic_root_commands(state)
 
+
 def _raw_exec_remote_cmd(host, command, target_netns="mgmt", output_format="text"):
+    """
+    Executes user-requested CLI commands on remote switches via JSON-RPC 'cli' method with strict mTLS authentication.
+    Operates 100% in-process with zero subprocess or shell commands.
+    """
     is_local = host in ("127.0.0.1", "localhost", "::1", get_local_hostname())
-    netns_val = f"srbase-{target_netns}" if target_netns != "default" else "srbase"
-    auth_flags = get_auth_curl_flags()
+    auth_headers = get_auth_headers()
     tls_info = resolve_tls_certificates()
 
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "cli",
+        "params": {
+            "commands": [command],
+            "output-format": output_format
+        }
+    }).encode("utf-8")
+
     if is_local:
-        cmd_args = [
-            "sudo", "-n", "ip", "netns", "exec", netns_val,
-            "curl", "-s"
-        ] + auth_flags + [
-            "-X", "POST", "http://127.0.0.1:80/jsonrpc",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "cli",
-                "params": {
-                    "commands": [command],
-                    "output-format": output_format
-                }
-            })
-        ]
+        switch_netns(target_netns)
+        # Local switch execution
         try:
-            res_bytes = subprocess.check_output(cmd_args, stderr=subprocess.PIPE, timeout=10)
-            res_str = res_bytes.decode().strip()
-            data = json.loads(res_str)
-            if output_format == "json":
+            req = urllib.request.Request("http://127.0.0.1:80/jsonrpc", data=body, headers=auth_headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
                 if "result" in data and data["result"]:
-                    return data["result"][0]
-                elif "error" in data:
-                    return {"error": data["error"]}
-                return data
-            if "result" in data and data["result"]:
-                obj = data["result"][0]
-                return obj if isinstance(obj, str) else json.dumps(obj, indent=2)
+                    obj = data["result"][0]
+                    if output_format == "json":
+                        return obj
+                    return obj if isinstance(obj, str) else json.dumps(obj, indent=2)
         except Exception:
             pass
 
-        # Fallback to local HTTPS 443 with -k (safe on loopback)
-        cmd_args = [
-            "sudo", "-n", "ip", "netns", "exec", netns_val,
-            "curl", "-k", "-s"
-        ] + auth_flags + [
-            "-X", "POST", "https://127.0.0.1:443/jsonrpc",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "cli",
-                "params": {
-                    "commands": [command],
-                    "output-format": output_format
-                }
-            })
-        ]
-    else:
-        ca_file = tls_info.get("ca_cert")
-        if not ca_file:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req_ssl = urllib.request.Request("https://127.0.0.1:443/jsonrpc", data=body, headers=auth_headers)
+            with urllib.request.urlopen(req_ssl, context=ctx, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if "result" in data and data["result"]:
+                    obj = data["result"][0]
+                    if output_format == "json":
+                        return obj
+                    return obj if isinstance(obj, str) else json.dumps(obj, indent=2)
+                elif "error" in data:
+                    if output_format == "json":
+                        return {"error": data["error"]}
+                    return f"JSON-RPC Error on local switch: {data['error']}\n"
+        except Exception as e:
             if output_format == "json":
-                return {"error": "Security Alert: Trusted CA certificate bundle not found on switch."}
-            return f"Security Alert on {host}: Trusted CA certificate bundle not found on switch. Aborting connection before sending credentials.\n"
+                return {"error": str(e)}
+            return f"Local Execution Error: {e}\n"
 
-        cmd_args = [
-            "sudo", "-n", "ip", "netns", "exec", netns_val,
-            "curl", "-s",
-            "--cacert", ca_file
-        ]
-        if tls_info.get("client_cert") and tls_info.get("client_key"):
-            cmd_args.extend(["--cert", tls_info["client_cert"], "--key", tls_info["client_key"]])
-        cmd_args.extend(auth_flags)
-        cmd_args.extend([
-            "-X", "POST", f"https://{host}/jsonrpc",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "cli",
-                "params": {
-                    "commands": [command],
-                    "output-format": output_format
-                }
-            })
-        ])
+    # Remote switch execution
+    switch_netns(target_netns)
+    ca_file = tls_info.get("ca_cert")
+    if not ca_file:
+        if output_format == "json":
+            return {"error": "Security Alert: Trusted CA certificate bundle not found on switch."}
+        return f"Security Alert on {host}: Trusted CA certificate bundle not found on switch. Aborting connection before sending credentials.\n"
 
     try:
-        res_bytes = subprocess.check_output(cmd_args, stderr=subprocess.PIPE, timeout=10)
-        res_str = res_bytes.decode().strip()
+        ctx = ssl.create_default_context(cafile=ca_file)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        if tls_info.get("client_cert") and tls_info.get("client_key"):
+            ctx.load_cert_chain(tls_info["client_cert"], tls_info["client_key"])
 
-        if "AuthenticationFailed" in res_str or "401 Unauthorized" in res_str:
-            if output_format == "json":
-                return {"error": "Authentication Failed: Invalid username or password"}
-            return f"Authentication Failed on {host} ({target_netns}): Invalid username or password.\n"
-
-        try:
-            data = json.loads(res_str)
-        except Exception:
-            if output_format == "json":
-                return {"error": f"API Response Error: {res_str}"}
-            return f"API Response Error on {host} ({target_netns}): Raw response: {res_str}\n"
-
-        if output_format == "json":
-            if "result" in data and data["result"]:
-                return data["result"][0]
-            elif "error" in data:
-                return {"error": data["error"]}
-            return data
-        else:
+        url = f"https://{host}:443/jsonrpc" if not host.startswith("http") else host
+        req = urllib.request.Request(url, data=body, headers=auth_headers)
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
             if "result" in data and data["result"]:
                 obj = data["result"][0]
-                if isinstance(obj, str):
+                if output_format == "json":
                     return obj
-                else:
-                    return json.dumps(obj, indent=2)
+                return obj if isinstance(obj, str) else json.dumps(obj, indent=2)
             elif "error" in data:
+                if output_format == "json":
+                    return {"error": data["error"]}
                 return f"JSON-RPC Error on {host}: {data['error']}\n"
-            return json.dumps(data, indent=2)
-    except subprocess.CalledProcessError as e:
-        code = e.returncode
-        stderr_msg = e.stderr.decode().strip() if e.stderr else ""
-        err_text = ""
-        if code == 60:
-            err_text = f"Security Alert: Untrusted Server CA / mTLS Verification Failed on {host}. Connection aborted before sending credentials."
-        elif code == 35:
-            err_text = f"Security Alert: mTLS Handshake / TLS Connect Failed on {host} (exit code 35). Remote host certificate invalid or rejected. Connection aborted before sending credentials."
-        elif code == 58:
-            err_text = f"Security Alert: Problem with local client certificate/key on {host} (exit code 58)."
-        elif code == 56:
-            err_text = f"Client mTLS Verification Failed on {host}: Remote server rejected client certificate or connection reset."
-        elif code == 77:
-            err_text = f"Security Alert: Problem reading SSL CA cert bundle on {host} (exit code 77)."
-        elif code in (7, 28):
-            err_text = f"Connection Failed on {host}: Host unreachable or timed out."
-        elif "AuthenticationFailed" in stderr_msg or "401" in stderr_msg:
+            return data if output_format == "json" else json.dumps(data, indent=2)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
             err_text = f"Authentication Failed on {host} ({target_netns}): Invalid username or password."
         else:
-            err_text = f"Command Execution Failed on {host} (exit code {code}): {stderr_msg or e}"
-        
+            err_text = f"HTTP Error {e.code} on {host}: {e.reason}"
+        if output_format == "json":
+            return {"error": err_text}
+        return err_text + "\n"
+    except ssl.SSLCertVerificationError as e:
+        err_text = f"Security Alert: Untrusted Server CA / mTLS Verification Failed on {host}: {e}. Connection aborted before sending credentials."
+        if output_format == "json":
+            return {"error": err_text}
+        return err_text + "\n"
+    except ssl.SSLError as e:
+        err_text = f"Security Alert: mTLS Handshake Failed on {host}: {e}"
+        if output_format == "json":
+            return {"error": err_text}
+        return err_text + "\n"
+    except urllib.error.URLError as e:
+        err_text = f"Connection Failed on {host}: Host unreachable or timed out ({e.reason})."
         if output_format == "json":
             return {"error": err_text}
         return err_text + "\n"
@@ -633,13 +826,26 @@ def _raw_exec_remote_cmd(host, command, target_netns="mgmt", output_format="text
             return {"error": str(e)}
         return f"Execution Error on {host} ({target_netns}): {e}\n"
 
+
 def exec_remote_cmd(host, command, netns="mgmt", output_format="text"):
-    res = _raw_exec_remote_cmd(host, command, "mgmt", output_format=output_format)
-    if isinstance(res, str) and ("Connection Failed" in res or "timed out" in res or "Execution Error" in res) and netns != "mgmt":
-        res_alt = _raw_exec_remote_cmd(host, command, netns, output_format=output_format)
-        if isinstance(res_alt, str) and "Connection Failed" not in res_alt and "timed out" not in res_alt and "Execution Error" not in res_alt:
-            return res_alt
-    return res
+    candidates = [netns]
+    if "mgmt" not in candidates:
+        candidates.append("mgmt")
+    if "default" not in candidates:
+        candidates.append("default")
+
+    last_res = None
+    for cand in candidates:
+        res = _raw_exec_remote_cmd(host, command, cand, output_format=output_format)
+        if isinstance(res, str) and ("Connection Failed" in res or "timed out" in res or "Execution Error" in res):
+            last_res = res
+            continue
+        elif isinstance(res, dict) and "error" in res and ("Connection Failed" in str(res["error"]) or "timed out" in str(res["error"])):
+            last_res = res
+            continue
+        return res
+    return last_res if last_res is not None else _raw_exec_remote_cmd(host, command, netns, output_format=output_format)
+
 
 def run_srlx_execution(output, target_devices, cmd):
     discovered = discover_srlinux_neighbors()
@@ -712,42 +918,11 @@ def run_srlx_execution(output, target_devices, cmd):
                 if not output_text.endswith("\n"):
                     output.print_line("")
 
-IS_IPV4_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
-
-def resolve_management_ip(name_or_ip):
-    if not name_or_ip:
-        return "Unknown"
-    
-    if IS_IPV4_RE.match(name_or_ip):
-        return name_or_ip
-    
-    try:
-        with open("/etc/hosts", "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    ip = parts[0]
-                    if IS_IPV4_RE.match(ip) and ip != "127.0.0.1":
-                        if name_or_ip in parts[1:]:
-                            return ip
-    except Exception:
-        pass
-
-    try:
-        resolved = socket.gethostbyname(name_or_ip)
-        if IS_IPV4_RE.match(resolved) and resolved != "127.0.0.1":
-            return resolved
-    except Exception:
-        pass
-
-    return name_or_ip
 
 def format_reporter_list(dev_name, reporter_list, local_name=None):
     clean_list = sorted(list(set([r for r in (reporter_list or []) if r != dev_name])), key=natural_sort_key)
     return ", ".join(clean_list) if clean_list else "None"
+
 
 def show_srlx_devices_callback(state, output, arguments, **_kwargs):
     resp = query_daemon_socket({"action": "get_devices"})
@@ -755,21 +930,12 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
     requested_fmt = get_requested_output_format(output)
 
     if not resp or resp.get("status") != "ok":
-        discovered = discover_srlinux_neighbors()
-        nodes = {}
-        for d, data in discovered.items():
-            nodes[d] = {
-                "mgmt_addrs": data.get("mgmt_addrs", [d]),
-                "netns": data.get("netns", "mgmt"),
-                "direct_reporters": ["local" if d == local_name else "lldp"],
-                "mesh_reporters": [],
-                "learned_via": "Local" if d == local_name else "Direct",
-                "status": "Local" if d == local_name else "mTLS OK",
-                "last_updated": time.time()
-            }
+        nodes = discover_srlinux_neighbors(state)
     else:
         vector = resp.get("vector", {})
         nodes = vector.get("nodes", {})
+        if not nodes:
+            nodes = discover_srlinux_neighbors(state)
 
     dev_names = sorted(list(nodes.keys()), key=natural_sort_key)
     if local_name in dev_names:
@@ -782,10 +948,7 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
         topo_dict = {}
         for d in dev_names:
             data = nodes[d]
-            raw_ip = data.get("mgmt_addrs", [d])[0]
-            ip = resolve_management_ip(raw_ip)
-            if not IS_IPV4_RE.match(ip):
-                ip = resolve_management_ip(d)
+            ip = resolve_neighbor_ip(data.get("mgmt_addrs", []), d)
             direct_reporters = [r for r in data.get("direct_reporters", []) if r != d]
             mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != d]
             learned_via = data.get("learned_via") or ("Local" if d == local_name else ("Direct" if local_name in direct_reporters else "Mesh"))
@@ -808,10 +971,7 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
         topo_dict = {}
         for d in dev_names:
             data = nodes[d]
-            raw_ip = data.get("mgmt_addrs", [d])[0]
-            ip = resolve_management_ip(raw_ip)
-            if not IS_IPV4_RE.match(ip):
-                ip = resolve_management_ip(d)
+            ip = resolve_neighbor_ip(data.get("mgmt_addrs", []), d)
             direct_reporters = [r for r in data.get("direct_reporters", []) if r != d]
             mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != d]
             learned_via = data.get("learned_via") or ("Local" if d == local_name else ("Direct" if local_name in direct_reporters else "Mesh"))
@@ -841,21 +1001,16 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
 
     for d in dev_names:
         data = nodes[d]
-        raw_ip = data.get("mgmt_addrs", [d])[0]
-        ip = resolve_management_ip(raw_ip)
-        if not IS_IPV4_RE.match(ip):
-            ip = resolve_management_ip(d)
-        
+        ip = resolve_neighbor_ip(data.get("mgmt_addrs", []), d)
         direct_reporters = [r for r in data.get("direct_reporters", []) if r != d]
         mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != d]
-        
         direct_str = format_reporter_list(d, direct_reporters, local_name)
         mesh_str = format_reporter_list(d, mesh_reporters, local_name)
-        
+
         learned_via = data.get("learned_via")
         if not learned_via:
             learned_via = "Local" if d == local_name else ("Direct" if local_name in direct_reporters else "Mesh")
-            
+
         raw_status = data.get("status", "")
         if d == local_name:
             reachable = "Local"
@@ -888,40 +1043,44 @@ def show_srlx_devices_callback(state, output, arguments, **_kwargs):
         output.print_line(_fmt_row(r))
     output.print_line(thin_sep + "\n")
 
+
 def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
     if hasattr(state, "is_last_command") and not state.is_last_command:
         return
 
-    target_name = extract_device_argument_value(arguments, state)
+    target_name = extract_unnamed_argument_value(arguments, "device", state)
     if not target_name:
         target_name = get_local_hostname()
 
     requested_fmt = get_requested_output_format(output)
     resp = query_daemon_socket({"action": "get_devices"})
-    nodes = resp.get("vector", {}).get("nodes", {}) if resp and resp.get("status") == "ok" else {}
     local_name = get_local_hostname()
+
+    if not resp or resp.get("status") != "ok":
+        nodes = discover_srlinux_neighbors(state)
+    else:
+        nodes = resp.get("vector", {}).get("nodes", {})
+        if not nodes:
+            nodes = discover_srlinux_neighbors(state)
 
     if target_name not in nodes:
         output.print_error_line(f"Device '{target_name}' not found in topology database.")
         return
 
     data = nodes[target_name]
-    raw_ip = data.get("mgmt_addrs", [target_name])[0]
-    ip = resolve_management_ip(raw_ip)
-    if not IS_IPV4_RE.match(ip):
-        ip = resolve_management_ip(target_name)
+    ip = resolve_neighbor_ip(data.get("mgmt_addrs", []), target_name)
     netns = data.get("netns", "mgmt")
-    
+
     direct_reporters = [r for r in data.get("direct_reporters", []) if r != target_name]
     mesh_reporters = [m for m in data.get("mesh_reporters", []) if m not in direct_reporters and m != target_name]
-    
+
     direct_str = format_reporter_list(target_name, direct_reporters, local_name)
     mesh_str = format_reporter_list(target_name, mesh_reporters, local_name)
-    
+
     learned_via = data.get("learned_via")
     if not learned_via:
         learned_via = "Local" if target_name == local_name else ("Direct" if local_name in direct_reporters else "Mesh")
-        
+
     raw_status = data.get("status", "")
     if target_name == local_name:
         reachable = "Local"
@@ -986,25 +1145,27 @@ def show_srlx_device_detail_callback(state, output, arguments, **_kwargs):
     output.print_line(f" mTLS Security State   : {sec_status_str}")
     output.print_line("======================================================================\n")
 
-def tools_srlx_clear_device_callback(state, output, arguments, **_kwargs):
-    target_name = extract_device_argument_value(arguments, state)
 
+def tools_srlx_clear_device_callback(state, output, arguments, **_kwargs):
+    target_name = extract_unnamed_argument_value(arguments, "device", state)
     if not target_name:
         output.print_error_line("Please specify a device name to clear.")
         return
 
     resp = query_daemon_socket({"action": "clear_device", "device": target_name})
     if resp and resp.get("status") == "ok":
-        output.print_line(f"Device '{target_name}' cleared from local SRLX topology cache.")
+        output.print_line(f"Device '{target_name}' cleared from local cache and topology re-synced.")
     else:
         output.print_error_line(f"Failed to clear device '{target_name}': {resp.get('message') if resp else 'Daemon unavailable'}")
+
 
 def tools_srlx_clear_all_callback(state, output, arguments, **_kwargs):
     resp = query_daemon_socket({"action": "clear_all"})
     if resp and resp.get("status") == "ok":
-        output.print_line("Local SRLX topology cache cleared. Triggering re-discovery scan...")
+        output.print_line("Local SRLX topology cache cleared and re-synced with direct LLDP neighbors.")
     else:
         output.print_error_line(f"Failed to clear topology cache: {resp.get('message') if resp else 'Daemon unavailable'}")
+
 
 def standalone_srlx_callback(state, output, arguments, **_kwargs):
     raw_args = arguments.get("srlx", "[target-device...] command") if arguments else None
@@ -1013,13 +1174,13 @@ def standalone_srlx_callback(state, output, arguments, **_kwargs):
     elif not raw_args:
         raw_args = []
 
-    discovered = discover_srlinux_neighbors()
+    discovered = discover_srlinux_neighbors(state)
     known_devices = set(discovered.keys())
 
     target_devices, cmd_tokens = parse_target_and_cmd_tokens(raw_args, known_devices)
-
     cmd = " ".join(cmd_tokens) if cmd_tokens else "show version"
     run_srlx_execution(output, target_devices, cmd)
+
 
 class Plugin(ToolsPlugin):
     def load(self, cli, **_kwargs):
@@ -1051,7 +1212,7 @@ class Plugin(ToolsPlugin):
         cli.add_global_command(syntax_standalone, update_location=False, only_at_start_of_line=True, callback=standalone_srlx_callback)
 
     def on_tools_load(self, state):
-        # 3. tools srlx clear all & tools srlx clear device <device>
+        # 3. tools srlx clear all & tools srlx clear device <node>
         tools_root = state.command_tree.tools_mode.root
         if not tools_root.get_command_or_none("srlx"):
             tools_srlx = Syntax("srlx", help="SRLX Gossip Protocol Topology Management Tools")
@@ -1061,6 +1222,7 @@ class Plugin(ToolsPlugin):
             clear_device_syntax.add_unnamed_argument("device", default=None, suggestions=get_neighbor_choices, help="Target device name to clear")
 
             tools_node = tools_root.add_command(tools_srlx, update_location=False)
+
             clear_node = tools_node.add_command(clear_syntax, update_location=False)
             clear_node.add_command(Syntax("all", help="Clear all devices from local topology cache"), update_location=False, callback=tools_srlx_clear_all_callback)
             clear_node.add_command(clear_device_syntax, update_location=False, callback=tools_srlx_clear_device_callback)

@@ -1,3 +1,5 @@
 clab-*/
 *.deb
 /lab/tls
+__pycache__/
+*.pyc

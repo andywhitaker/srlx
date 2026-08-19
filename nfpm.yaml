@@ -1,7 +1,7 @@
 name: "srlx"
 arch: "all"
 platform: "linux"
-version: "0.0.3"
+version: "0.0.4"
 section: "default"
 priority: "optional"
 maintainer: "Andy Whitaker <andy.whitaker@nokia.com>"
@@ -13,12 +13,12 @@ contents:
     dst: "/opt/srlx/bin/srlx-daemon.py"
     file_info:
       mode: 0755
-  - src: "scripts/get_vector.py"
-    dst: "/opt/srlx/bin/get_vector.py"
-    file_info:
-      mode: 0755
   - src: "srlx.yang"
     dst: "/opt/srlx/models/srlx.yang"
+    file_info:
+      mode: 0644
+  - src: "srlx.yang"
+    dst: "/etc/opt/srlinux/models/srlx.yang"
     file_info:
       mode: 0644
   - src: "srlx.yml"
