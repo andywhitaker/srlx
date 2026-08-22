@@ -1218,7 +1218,7 @@ class Plugin(ToolsPlugin):
             dev_node.add_command(Syntax("detail", help="Detailed attribution"), update_location=False, callback=show_srlx_device_detail_callback)
 
         # 2. Standalone global execution (srlx [devices...] <cmd...>)
-        syntax_standalone = Syntax("srlx", help="Execute command on switch(es) without local command leakage")
+        syntax_standalone = Syntax("srlx", help="Execute commands on remote switches")
         syntax_standalone.add_unnamed_argument(
             "[target-device...] command",
             default=None,
