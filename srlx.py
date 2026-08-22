@@ -22,6 +22,18 @@ except Exception:
     DATASTORE_AVAILABLE = False
 
 try:
+    from srlinux.mgmt.cli_engine.line_parser_auto_suggester import LineParserAutoSuggester
+    _ORIG_LINE_PARSER_AUTO_SUGGESTER_GET_OPTIONS = LineParserAutoSuggester.get_options
+except Exception:
+    LineParserAutoSuggester = None
+    _ORIG_LINE_PARSER_AUTO_SUGGESTER_GET_OPTIONS = None
+
+try:
+    from srlinux.mgmt.cli_engine.line_parser_auto_completer import percolate_values
+except Exception:
+    percolate_values = None
+
+try:
     from srlinux.mgmt.cli.output_format import OutputFormat, OUTPUT_FORMAT_MODIFIABLE_COMMANDS
     if "srlx" not in OUTPUT_FORMAT_MODIFIABLE_COMMANDS:
         OUTPUT_FORMAT_MODIFIABLE_COMMANDS.append("srlx")
@@ -633,6 +645,24 @@ def get_dynamic_root_commands(state=None):
     return sorted(list(root_cmds), key=natural_sort_key)
 
 
+def _srlx_patched_auto_suggester_get_options(self, partial_word, line, completer_settings=None):
+    if line and line.strip().startswith("srlx"):
+        tokens = line.split()[1:]  # tokens after 'srlx'
+        dev_tokens, cmd_tokens = parse_target_and_cmd_tokens(tokens)
+        if cmd_tokens:
+            inner_line = " ".join(cmd_tokens) + " "
+            return _ORIG_LINE_PARSER_AUTO_SUGGESTER_GET_OPTIONS(self, partial_word, inner_line, completer_settings)
+        elif not partial_word:
+            opts, parse_res = _ORIG_LINE_PARSER_AUTO_SUGGESTER_GET_OPTIONS(self, partial_word, line, completer_settings)
+            return ["<[target-device...] command>"], parse_res
+
+    return _ORIG_LINE_PARSER_AUTO_SUGGESTER_GET_OPTIONS(self, partial_word, line, completer_settings)
+
+
+if LineParserAutoSuggester and _ORIG_LINE_PARSER_AUTO_SUGGESTER_GET_OPTIONS:
+    LineParserAutoSuggester.get_options = _srlx_patched_auto_suggester_get_options
+
+
 def get_srlx_unified_suggestions(*args, **kwargs):
     try:
         state = args[1] if len(args) >= 2 else None
@@ -655,57 +685,23 @@ def get_srlx_unified_suggestions(*args, **kwargs):
         if not line_str or not line_str.startswith("srlx"):
             return remaining_neighbors + dynamic_root_commands
 
-        tokens = line_str.split()
-        raw_tokens = tokens[1:] if len(tokens) > 1 else []
-
-        dev_tokens, cmd_tokens = parse_target_and_cmd_tokens(raw_tokens, known_neighbors)
-        unused_neighbors = [n for n in remaining_neighbors if n not in dev_tokens]
+        tokens = line_str.split()[1:] if len(line_str.split()) > 1 else []
+        dev_tokens, cmd_tokens = parse_target_and_cmd_tokens(tokens, known_neighbors)
 
         if not cmd_tokens:
+            unused_neighbors = [n for n in remaining_neighbors if n not in dev_tokens]
             return unused_neighbors + dynamic_root_commands
 
-        cmd_str = " ".join(cmd_tokens)
-        if line_str.endswith(" "):
-            cmd_str += " "
+        cmd_line = " ".join(cmd_tokens) + " "
 
         if state:
             try:
-                lp = state.create_line_parser(state)
-                parsed_line = lp.parse(cmd_str)
-                last_node_obj = parsed_line.last_node
-
-                suggestions = set()
-                cn = getattr(last_node_obj, "node", None)
-                if cn:
-                    for c in get_child_cmds(cn, state):
-                        name = getattr(c, "name", "")
-                        if name and name != "/":
-                            suggestions.add(name)
-
-                bound_args = set()
-                all_args = getattr(last_node_obj, "all_arguments", None)
-                if isinstance(all_args, dict):
-                    bound_args = set(all_args.keys())
-                elif hasattr(last_node_obj, "local_arguments") and isinstance(last_node_obj.local_arguments, dict):
-                    bound_args = set(last_node_obj.local_arguments.keys())
-
-                syntax_obj = getattr(last_node_obj, "syntax", None)
-                syntax_args = getattr(syntax_obj, "arguments", []) if syntax_obj else []
-
-                for arg in syntax_args:
-                    arg_name = getattr(arg, "name", None)
-                    if arg_name and arg_name in bound_args:
-                        continue
-                    if hasattr(arg, "get_values"):
-                        vals = list(arg.get_values(state, last_node_obj, partial_word, cmd_str))
-                        for v in vals:
-                            if v:
-                                suggestions.add(v)
-
-                if suggestions:
-                    return sorted(list(suggestions))
-                else:
-                    return []
+                lp = state.create_line_parser(state).auto_completion_clone()
+                res = lp.mode_aware_parse_get_details(cmd_line)
+                if percolate_values:
+                    return percolate_values(res, partial_word, cmd_line)
+                elif hasattr(res, "get_values"):
+                    return list(res.get_values(partial_word=partial_word, line=cmd_line))
             except Exception:
                 pass
 
@@ -1186,7 +1182,15 @@ def tools_srlx_clear_all_callback(state, output, arguments, **_kwargs):
 
 
 def standalone_srlx_callback(state, output, arguments, **_kwargs):
-    raw_args = arguments.get("srlx", "[target-device...] command") if arguments else None
+    raw_args = None
+    if arguments:
+        for key in ["command", "[target-device...] command", "srlx"]:
+            try:
+                raw_args = arguments.get("srlx", key) or arguments.get(key)
+                if raw_args:
+                    break
+            except Exception:
+                pass
     if isinstance(raw_args, str):
         raw_args = [raw_args]
     elif not raw_args:
@@ -1218,9 +1222,13 @@ class Plugin(ToolsPlugin):
             dev_node.add_command(Syntax("detail", help="Detailed attribution"), update_location=False, callback=show_srlx_device_detail_callback)
 
         # 2. Standalone global execution (srlx [devices...] <cmd...>)
-        syntax_standalone = Syntax("srlx", help="Execute commands on remote switches")
+        syntax_standalone = Syntax(
+            "srlx",
+            help="Execute command on remote switches",
+            usage_list=["[<target-device>...] <command>"]
+        )
         syntax_standalone.add_unnamed_argument(
-            "[target-device...] command",
+            "command",
             default=None,
             min_count=1,
             max_count="*",
